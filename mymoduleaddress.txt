@@ -1,0 +1,10 @@
+first_char = "?1" # 사용자 정의 1번
+lower = "?2"      # 사용자 정의 2번 (소문자)
+digit = "?d"      # 숫자
+special = "?4"    # 사용자 정의 4번 (특수문자)
+
+for k in range(3): # k = 0, 1, 2
+    for n in range(1, 14 - k + 1):
+        # 구조: 첫글자(1) + 소문자(n) + 숫자(13-n-k) + 특수문자(k)
+        mask = first_char + (lower * n) + (digit * (13 - n - k)) + (special * k)
+        print(mask)
