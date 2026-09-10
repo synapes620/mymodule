@@ -1,0 +1,92 @@
+=== TUF Backend Repository - 14 Days Diff Summary ===
+
+Repository: https://github.com/T21C/tuf-backend.git
+Date Range: 14 days (2026-08-27 ~ 2026-09-10)
+
+Base Commit (14 days ago):
+  dee726e9: feat: enhance community tag scoring and voting functionality
+
+Current Commit (HEAD):
+  1780cd1: Merge pull request #84 from T21C/dev
+
+Total Commits in 14 days: 24 commits
+
+=== Files Included ===
+1. tuf-backend-14day.diff (26,473 lines)
+   - Complete diff showing all changes from 14 days ago to current HEAD
+   - Format: Unified diff format
+
+2. tuf-backend-full.tar.gz (132 MB)
+   - Complete repository snapshot including:
+     * Full source code
+     * Git history (.git directory)
+     * Configuration files
+     * Node dependencies (if present)
+
+=== How to Use ===
+
+Extract the archive:
+  tar -xzf tuf-backend-full.tar.gz
+
+Apply diff to another repository:
+  git apply tuf-backend-14day.diff
+
+View specific diff:
+  cat tuf-backend-14day.diff
+
+=== Recent Commits (24 total) ===
+1780cd1f Merge pull request #84 from T21C/dev
+ebf14b7e feat: enhance profile module management and pack handling
+3f660225 Merge pull request #83 from T21C/dev
+191f8fab fix undefined warn
+21340d59 Merge pull request #82 from T21C/dev
+f3f997f8 fix nullable val check
+3fba0a6e refactor: update community tag rematerialization and voting logic
+a442d137 feat: implement profile modules management in creator and player routes
+9a35cf32 Merge pull request #81 from T21C/dev
+78cd02c9 feat: enhance community tag voting logic and introduce new weight calculations
+7665d1dd Merge pull request #80 from T21C/dev
+b291b17d feat: implement YouTube channel linking functionality
+6b2011b3 Merge pull request #79 from T21C/dev
+3d483e92 feat: enhance team and creator submission handling in admin routes
+820e8049 upd adofai-lib package
+a547ce34 Merge pull request #78 from T21C/dev
+5ea8f3bb feat: add disqualified attribute to tournament placements
+fc66cb96 Merge pull request #77 from T21C/dev
+aa0ea823 feat: add tournament support across the application
+7bb4d7c0 Merge pull request #76 from T21C/dev
+f6977815 feat: implement MODZIP support in CDN service and related routes
+ee528f6d feat: add MODS_START_GUIDE_CTA_DISMISSED preference key and related tests
+3a5993f7 Merge pull request #75 from T21C/dev
+4dba5393 feat: add UserClientPreferences model and integrate into auth system
+1d8bb60f feat: add deprecatedAfter field to mod model and related functionalities
+0da3e121 feat: enhance following filter functionality in creators and players routes
+9fe51e5f Merge pull request #74 from T21C/dev
+63ba2c1c feat: enhance mod management with new features and improvements
+27c28b09 Merge pull request #73 from T21C/dev
+fb059d47 fix bad test case
+32dcedab fix lint
+fa6af637 feat: enhance mod management and indexing capabilities
+b1947c70 feat: add mods catalog seeding and routing
+042bdac1 submission lock feature
+0db695a0 Merge pull request #72 from T21C/dev
+3ecd2311 fix: update requireTopPlay logic to inherit from group settings
+703db6f1 feat: implement top play requirement satisfaction logic
+1f70956c Merge pull request #71 from T21C/dev
+fa46e76b feat: add shorthand field to UsefulLink and UsefulLinkLocale models
+2854e140 Merge pull request #70 from T21C/dev
+cba4156d refactor: remove obsolete useful link cluster and tag models
+48bac916 Merge pull request #69 from T21C/dev
+fffb0fa1 fix final lint
+b8f6d82e fix incorrect test typing
+504d424d fix invalid git state
+65cca6ca feat: introduce useful link tags and clusters functionality
+c31a470d Merge pull request #68 from T21C/dev
+276deee1 feat: add caching logic for levelId filters in packs route
+67f78528 use json5 reader for scanning oversized levels and ignore non-server error on autorater
+e0996585 feat: enhance community tag display and scoring logic
+6ab847ff Merge pull request #67 from T21C/dev
+3dab9592 feat: add requireTopPlay functionality to community tags
+6e72edf4 feat: implement community assignment destruction logic and enhance rematerialization options
+9bf3010e Merge pull request #66 from T21C/dev
+dee726e9 feat: enhance community tag scoring and voting functionality
