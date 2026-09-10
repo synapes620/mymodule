@@ -1,0 +1,31 @@
+import {Router} from 'express';
+import levelRoutes from './levels/index.js';
+import passRoutes from './passes/index.js';
+import playerRoutes from './players.js';
+import leaderboardRoutes from './leaderboard.js';
+import difficultyRoutes from './difficulties/index.js';
+import referenceRoutes from './references.js';
+import statisticsRoutes from './statistics.js';
+import creatorRoutes from './creators.js';
+import artistsRoutes from './artists.js';
+import songsRoutes from './songs.js';
+import tournamentsRoutes from './tournaments.js';
+
+export default function createDatabaseRouter(): Router {
+  const router = Router();
+
+  // Initialize routes with leaderboardCache middleware
+  router.use('/levels', levelRoutes);
+  router.use('/passes', passRoutes);
+  router.use('/players', playerRoutes);
+  router.use('/leaderboard', leaderboardRoutes);
+  router.use('/difficulties', difficultyRoutes);
+  router.use('/references', referenceRoutes);
+  router.use('/statistics', statisticsRoutes);
+  router.use('/creators', creatorRoutes);
+  router.use('/artists', artistsRoutes);
+  router.use('/songs', songsRoutes);
+  router.use('/tournaments', tournamentsRoutes);
+
+  return router;
+}

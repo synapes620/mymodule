@@ -1,0 +1,95 @@
+import {Model, DataTypes, Optional} from 'sequelize';
+import LevelSubmission from './LevelSubmission.js';
+import Artist from '@/models/artists/Artist.js';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+const sequelize = getSequelizeForModelGroup('submissions');
+
+type LevelSubmissionArtistRequestAttributes = {
+  id: number;
+  submissionId: number;
+  artistId: number | null;
+  artistName: string | null;
+  isNewRequest: boolean;
+  verificationState: Artist['verificationState'] | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+type LevelSubmissionArtistRequestCreationAttributes = Optional<LevelSubmissionArtistRequestAttributes, 'id' | 'createdAt' | 'updatedAt'>;
+
+class LevelSubmissionArtistRequest extends Model<LevelSubmissionArtistRequestAttributes, LevelSubmissionArtistRequestCreationAttributes> {
+  declare id: number;
+  declare submissionId: number;
+  declare artistId: number | null;
+  declare artistName: string | null;
+  declare isNewRequest: boolean;
+  declare verificationState: Artist['verificationState'] | null;
+  declare createdAt: Date;
+  declare updatedAt: Date;
+
+  // Associations
+  declare submission: LevelSubmission;
+  declare artist: Artist | null;
+}
+
+LevelSubmissionArtistRequest.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    submissionId: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: {
+        model: 'level_submissions',
+        key: 'id',
+      },
+      onDelete: 'CASCADE',
+      onUpdate: 'CASCADE',
+    },
+    artistId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'artists',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+    },
+    artistName: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+    isNewRequest: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    verificationState: {
+      type: DataTypes.ENUM('unverified', 'pending', 'declined', 'mostly_declined', 'mostly_allowed', 'allowed', 'ysmod_only', 'tuf_verified'),
+      allowNull: true,
+      defaultValue: null,
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize,
+    tableName: 'level_submission_artist_requests',
+    indexes: [
+      {fields: ['submissionId']},
+      {fields: ['artistId']},
+    ],
+  },
+);
+
+export default LevelSubmissionArtistRequest;

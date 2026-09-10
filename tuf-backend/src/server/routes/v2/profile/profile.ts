@@ -1,0 +1,1132 @@
+import {Router, Request, Response} from 'express';
+import {Auth} from '@/server/middleware/auth.js';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import { errorResponseSchema, successMessageSchema, standardErrorResponses, standardErrorResponses404500, standardErrorResponses500, stringIdParamSpec } from '@/server/schemas/v2/profile/index.js';
+import {OAuthProvider, User} from '@/models/index.js';
+import sequelize from '@/config/db.js';
+import { Op } from 'sequelize';
+import UsernameChange from '@/models/auth/UsernameChange.js';
+import Player from '@/models/players/Player.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { multerMemoryCdnImage10Mb as upload } from '@/config/multerMemoryUploads.js';
+import cdnService from '@/server/services/core/CdnService.js';
+import { CdnError, respondWithCdnError } from '@/server/services/core/CdnService.js';
+import { safeTransactionRollback } from '@/misc/utils/Utility.js';
+import ElasticsearchService from '@/server/services/elasticsearch/ElasticsearchService.js';
+import { hasFlag } from '@/misc/utils/auth/permissionUtils.js';
+import { parseBannerPresetForStorage } from '@/misc/utils/profileBannerPreset.js';
+import {
+  MAX_PROFILE_HEADER_SURFACE_STACK_ENTRY_ID_LENGTH,
+  parseProfileHeaderSurfaceStyle,
+  parseProfileHeaderSurfaceStyle as parseStoredSurfaceStyle,
+  ProfileHeaderSurfaceStyleError,
+  type ProfileHeaderSurfaceStyle,
+} from '@/misc/utils/profileHeaderSurfaceStyle.js';
+import {
+  clearSurfaceImageAssetsWhenNoImageLayers,
+  getReferencedImageLayerIds,
+  reconcileProfileHeaderSurfaceImageAssets,
+  removeSurfaceImageAsset,
+  upsertSurfaceImageAsset,
+} from '@/server/services/profileHeaderSurfaceImage.js';
+import { permissionFlags } from '@/config/constants.js';
+import {
+  accountCredentialService,
+  CredentialError,
+} from '@/server/services/accounts/AccountCredentialService.js';
+import { refreshTokenService } from '@/misc/utils/auth/auth.js';
+import { parseClientIp } from '@/misc/utils/auth/rateLimitSubjects.js';
+import { stepUpGrantService } from '@/server/services/auth/StepUpGrantService.js';
+
+function parseHeaderSurfaceLayerId(req: Request): string | null {
+  const raw = (req.body as { layerId?: unknown })?.layerId ?? req.query.layerId;
+  if (typeof raw !== 'string') return null;
+  const layerId = raw.trim();
+  if (!layerId.length || layerId.length > MAX_PROFILE_HEADER_SURFACE_STACK_ENTRY_ID_LENGTH) {
+    return null;
+  }
+  return layerId;
+}
+import { CUSTOM_PROFILE_BANNERS_ENABLED } from '@/config/env.js';
+import { Cache, CacheInvalidation } from '@/server/middleware/cache.js';
+import {
+  clearBannerPresetForEntity,
+  clearCustomBannerForEntity,
+  deleteHeaderSurfaceImageForEntity,
+  patchHeaderSurfaceStyleForEntity,
+  setBannerPresetForEntity,
+  uploadCustomBannerForEntity,
+  uploadHeaderSurfaceImageForEntity,
+} from '@/server/services/profileCustomization/presentationMutations.js';
+import { patchPlainBioForEntity } from '@/server/services/bioCanvasProfile.js';
+import { AccountDeletionService } from '@/server/services/accounts/AccountDeletionService.js';
+import {
+  tufStellarExpiresAtActive,
+} from '@/misc/utils/subscriptions/tufStellarSubscription.js';
+import { buildAuthProfileUser } from '@/server/services/auth/authProfileSerializer.js';
+
+const router: Router = Router();
+const elasticsearchService = ElasticsearchService.getInstance();
+const accountDeletionService = AccountDeletionService.getInstance();
+
+import {
+  getUsernameFormatError,
+  isUsernameChanging,
+  parseUsernameFromBody,
+  USERNAME_MAX_LEN,
+  USERNAME_MIN_LEN,
+} from '@/misc/utils/auth/username.js';
+import {
+  appendPlayerAliasFromRename,
+} from '@/server/services/aliases/nameChangeAliases.js';
+
+const usernameChangeCooldown = 1 * 24 * 60 * 60 * 1000; // 1 day
+
+const GIF_ENABLED = process.env.CUSTOM_PROFILE_BANNERS_ENABLED === 'true' ? true : false;
+
+/** Multipart field `avatarMode`: cropped JPEG pipeline vs raw GIF (CDN PROFILE + gif-resize, same as difficulty icons). */
+type ProfileAvatarUploadMode = 'static' | 'animated';
+
+function parseProfileAvatarMode(body: unknown): ProfileAvatarUploadMode {
+  const raw =
+    typeof body === 'object' &&
+    body !== null &&
+    'avatarMode' in body &&
+    (body as Record<string, unknown>).avatarMode != null
+      ? String((body as Record<string, unknown>).avatarMode).trim().toLowerCase()
+      : '';
+  if (raw === 'animated') return 'animated';
+  return 'static';
+}
+
+function isGifAvatarFile(file: Express.Multer.File): boolean {
+  return file.mimetype === 'image/gif' || /\.gif$/i.test(file.originalname || '');
+}
+
+// Get current user profile
+router.get(
+  '/me',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'getProfileMe',
+    summary: 'Get current user profile',
+    description: 'Returns the authenticated user profile with player and OAuth providers',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: {
+        description: 'User profile',
+        schema: {
+          type: 'object',
+          properties: {
+            user: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                username: { type: 'string' },
+                email: { type: 'string' },
+                avatarUrl: { type: 'string' },
+                isRater: { type: 'boolean' },
+                isSuperAdmin: { type: 'boolean' },
+                playerId: { type: 'string' },
+                player: { type: 'object' },
+              },
+            },
+          },
+        },
+      },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  Cache({
+    varyByUser: true,
+    tags: (req: Request) => [`user:${req.user?.id}`]
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const tokenUser = req.user;
+    if (!tokenUser) {
+      return res.status(401).json({error: 'User not authenticated'});
+    }
+
+    const profileUser = await buildAuthProfileUser(tokenUser.id);
+    if (!profileUser) {
+      return res.status(401).json({error: 'User not authenticated'});
+    }
+
+    return res.json({ user: profileUser });
+  } catch (error) {
+    logger.error('Error fetching user profile:', error);
+    return res.status(500).json({error: 'Failed to fetch user profile'});
+  }
+  }
+);
+
+// Update user profile
+router.put(
+  '/me',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putProfileMe',
+    summary: 'Update profile',
+    description: 'Update username, nickname, or country for the current user',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    requestBody: {
+      description: 'Optional username, nickname, country',
+      schema: { type: 'object', properties: { username: { type: 'string' }, nickname: { type: 'string' }, country: { type: 'string' } } },
+      required: false,
+    },
+    responses: {
+      200: { description: 'Profile updated', schema: successMessageSchema },
+      400: { description: 'Validation error', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      429: { description: 'Username change rate limit', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const username = parseUsernameFromBody(req.body.username);
+    const user = req.user;
+
+    if (!user) {
+      throw {'error': 'User not authenticated', 'code': 401};
+    }
+
+    if (req.body.nickname && req.body.nickname.length > 60) {
+      throw {'error': 'Nickname must be less than 60 characters', 'code': 400};
+    }
+
+    if (req.body.nickname && req.body.nickname.length < 3) {
+      throw {'error': 'Nickname must be at least 3 characters', 'code': 400};
+    }
+    // Check if nickname is being changed and validate uniqueness
+    if (req.body.nickname && req.body.nickname !== user.nickname) {
+      const existingPlayer = await Player.findOne({
+        where: {
+          name: req.body.nickname,
+          id: { [Op.ne]: user.playerId } // Exclude current player
+        },
+        transaction
+      });
+      const existingUser = await User.findOne({
+        where: {nickname: req.body.nickname},
+        transaction
+      });
+      if (existingPlayer || existingUser) {
+        throw {'error': 'Nickname already taken', 'code': 400};
+      }
+    }
+    const targetPlayerName = req.body.nickname || user.player?.name || user.nickname;
+    // Check if username is being changed (case-insensitive)
+    if (isUsernameChanging(req.body.username, user.username) && username) {
+      if (username.length > USERNAME_MAX_LEN) {
+        throw {'error': `Username must be at most ${USERNAME_MAX_LEN} characters`, 'code': 400};
+      }
+      if (username.length < USERNAME_MIN_LEN) {
+        throw {'error': `Username must be at least ${USERNAME_MIN_LEN} characters`, 'code': 400};
+      }
+      const usernameFormatError = getUsernameFormatError(username);
+      if (usernameFormatError) {
+        throw { error: usernameFormatError, code: 400 };
+      }
+
+      // Check if username is taken (exclude current user)
+      const existingUser = await User.findOne({
+        where: {username, id: {[Op.ne]: user.id}},
+        transaction
+      });
+
+      if (existingUser) {
+        throw {'error': 'Username already taken', 'code': 400};
+      }
+
+      // Check rate limit if user has changed username before
+      if (user.lastUsernameChange) {
+        const msSinceLastChange = Date.now() - new Date(user.lastUsernameChange).getTime();
+        const msRemaining = usernameChangeCooldown - msSinceLastChange;
+
+        if (msRemaining > 0) {
+          const hours = Math.floor(msRemaining / (60 * 60 * 1000));
+          const minutes = Math.floor((msRemaining % (60 * 60 * 1000)) / (60 * 1000));
+          const seconds = Math.floor((msRemaining % (60 * 1000)) / 1000);
+
+          const timeString = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+          const nextAvailableChange = new Date(user.lastUsernameChange.getTime() + usernameChangeCooldown);
+
+          throw {
+            error: `Username can only be changed once every ${usernameChangeCooldown / (24 * 60 * 60 * 1000)} days. Time remaining: ${timeString}`,
+            nextAvailableChange: nextAvailableChange.toISOString(),
+            timeRemaining: {
+              hours,
+              minutes,
+              seconds,
+              milliseconds: msRemaining,
+              formatted: timeString
+            },
+            code: 429
+          };
+        }
+      }
+
+      // Create username change record
+      await UsernameChange.create({
+        userId: user.id,
+        oldUsername: user.username,
+        newUsername: username,
+        updatedAt: new Date()
+      }, { transaction });
+
+      // Update user with new username and tracking info
+      await User.update(
+        {
+          username,
+          nickname: req.body.nickname,
+          previousUsername: user.username,
+          lastUsernameChange: new Date()
+        },
+        {
+          where: {id: user.id},
+          transaction
+        }
+      );
+    } else {
+      // Just update nickname if username isn't changing
+      // Check if player name is being changed and validate uniqueness
+
+      if (targetPlayerName !== user.player?.name) {
+        const existingPlayer = await Player.findOne({
+          where: {
+            name: targetPlayerName,
+            id: { [Op.ne]: user.playerId } // Exclude current player
+          },
+          transaction
+        });
+        if (existingPlayer) {
+          throw {'error': 'Player name already taken', 'code': 400};
+        }
+        if (user.playerId && user.player?.name) {
+          await appendPlayerAliasFromRename(
+            user.playerId,
+            user.player.name,
+            targetPlayerName,
+            transaction,
+          );
+        }
+      }
+      await User.update(
+        { nickname: targetPlayerName },
+        {
+          where: {id: user.id},
+          transaction
+        }
+      );
+      await Player.update(
+        {
+          name: targetPlayerName,
+        },
+        {
+          where: {id: user.playerId},
+          transaction
+        }
+      );
+    }
+
+    if (user.playerId && typeof req.body.country === 'string' && req.body.country.length) {
+      await Player.update(
+        {country: req.body.country},
+        {
+          where: {id: user.playerId},
+          transaction
+        }
+      );
+    }
+
+    // Fetch updated user data with providers
+    const updatedUser = await User.findByPk(user.id, { transaction });
+    const providers = await OAuthProvider.findAll({
+      where: {userId: user.id},
+      attributes: ['provider', 'providerId'],
+      transaction
+    });
+
+    if (!updatedUser) {
+      throw {'error': 'User not found after update', 'code': 404};
+    }
+
+    await transaction.commit();
+
+    // Update Elasticsearch after successful commit (don't fail request if this fails)
+    try {
+      await elasticsearchService.updatePlayerPasses(user.playerId!);
+    } catch (elasticsearchError) {
+      // Log but don't fail the request - the database update was successful
+      logger.error('Error updating Elasticsearch after profile update:', elasticsearchError);
+    }
+
+    // Invalidate user-specific cache
+    await CacheInvalidation.invalidateUser(user.id);
+
+    return res.json({
+      message: 'Profile updated successfully',
+      user: {
+        id: updatedUser.id,
+        nickname: updatedUser.nickname || updatedUser.username,
+        username: updatedUser.username,
+        email: updatedUser.email,
+        avatarUrl: updatedUser.avatarUrl,
+        isRater: hasFlag(updatedUser, permissionFlags.RATER),
+        isSuperAdmin: hasFlag(updatedUser, permissionFlags.SUPER_ADMIN),
+        isRatingBanned: hasFlag(updatedUser, permissionFlags.RATING_BANNED),
+        isEmailVerified: hasFlag(updatedUser, permissionFlags.EMAIL_VERIFIED),
+        permissionFlags: updatedUser.permissionFlags,
+        playerId: updatedUser.playerId,
+        lastUsernameChange: updatedUser.lastUsernameChange,
+        previousUsername: updatedUser.previousUsername,
+        providers: providers.map((p: OAuthProvider) => ({
+          name: p.provider,
+          providerId: p.providerId,
+        })),
+      },
+    });
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+
+    // The validation paths above signal expected failures by throwing a plain
+    // object with a numeric `code`, and the client reads their extra fields
+    // (nextAvailableChange, timeRemaining), so those are still echoed verbatim.
+    // Anything else is a real exception and must not be: Sequelize's
+    // DatabaseError carries enumerable `sql` and `parameters`, which would hand
+    // the caller the failing query and its bound values. A non-numeric `code`
+    // (mysql's 'ER_DUP_ENTRY') also used to reach res.status() and throw.
+    const status = error?.code;
+    if (typeof status !== 'number' || status < 400 || status > 599) {
+      logger.error('Error updating user profile:', error);
+      return res.status(500).json({error: 'Failed to update profile'});
+    }
+    return res.status(status).json(error);
+  }
+  }
+);
+
+// Update password
+router.put(
+  '/password',
+  Auth.user(),
+  stepUpGrantService.requireStepUp('security'),
+  ApiDoc({
+    operationId: 'putProfilePassword',
+    summary: 'Change password',
+    description:
+      'Update password for the authenticated user. Requires recent step-up confirmation.',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    requestBody: {
+      description: 'Current and new password',
+      schema: {
+        type: 'object',
+        properties: { currentPassword: { type: 'string' }, newPassword: { type: 'string' } },
+        required: ['newPassword'],
+      },
+    },
+    responses: {
+      200: { description: 'Password updated', schema: successMessageSchema },
+      400: { description: 'Validation error', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const {currentPassword, newPassword} = req.body;
+    const user = req.user;
+
+    if (!user) {
+      return res.status(401).json({error: 'User not authenticated'});
+    }
+
+    // Keep the device making the change signed in and drop the rest. Bearer
+    // callers have no refresh cookie, so their session cannot be identified and
+    // every session is revoked instead.
+    const currentRefreshToken = req.cookies?.refreshToken;
+    const currentRecord = currentRefreshToken
+      ? await refreshTokenService.findValidRefreshToken(currentRefreshToken)
+      : null;
+
+    const { revokedSessions, keptCurrentSession } =
+      await accountCredentialService.changePassword(
+        user.id,
+        {
+          currentPassword,
+          newPassword,
+          keepSessionId: currentRecord?.id ?? null,
+        },
+        { ip: parseClientIp(req), userAgent: req.get('user-agent') },
+      );
+
+    return res.json({
+      message: 'Password updated successfully',
+      revokedSessions,
+      keptCurrentSession,
+    });
+  } catch (error) {
+    if (error instanceof CredentialError) {
+      return res
+        .status(error.statusCode)
+        .json({error: error.message, code: error.code});
+    }
+    logger.error('Error updating password:', error);
+    return res.status(500).json({error: 'Failed to update password'});
+  }
+  }
+);
+
+// Upload avatar
+router.post(
+  '/avatar',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'postProfileAvatar',
+    summary: 'Upload avatar',
+    description:
+      'Multipart: field `avatar` (image). Optional `avatarMode`: `static` (default) = cropped/processed upload (JPEG or GIF, e.g. client-cropped animated GIF); `animated` = raw GIF only, no client-side crop.',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'Multipart form: avatar (file), avatarMode (optional: static | animated)', required: true },
+    responses: {
+      200: { description: 'Avatar URL updated', schema: { type: 'object', properties: { avatarUrl: { type: 'string' } } } },
+      400: { description: 'No file or invalid type', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  upload.single('avatar'),
+  async (req: Request, res: Response) => {
+    try {
+        const user = req.user;
+        if (!user) {
+            return res.status(401).json({error: 'User not authenticated'});
+        }
+
+        if (!req.file) {
+            return res.status(400).json({
+                error: 'No file uploaded',
+                code: 'NO_FILE'
+            });
+        }
+
+        const avatarMode = parseProfileAvatarMode(req.body);
+        const gif = isGifAvatarFile(req.file);
+        if (gif && !tufStellarExpiresAtActive(user.tufStellarBilling?.tufStellarSubscriptionExpiresAt ?? null)) {
+            return res.status(403).json({
+                error: 'GIF profile pictures require active TUFStellar access',
+                code: 'AVATAR_GIF_FORBIDDEN',
+            });
+        }
+        if (!GIF_ENABLED && gif) {
+            return res.status(400).json({
+                error: 'Animated avatars are disabled',
+                code: 'AVATAR_ANIMATED_MODE_DISABLED',
+            });
+        }
+        if (avatarMode === 'animated' && !gif) {
+            return res.status(400).json({
+                error: 'avatarMode=animated accepts GIF files only.',
+                code: 'AVATAR_ANIMATED_MODE_GIF_ONLY',
+            });
+        }
+
+        // Upload to CDN
+        const result = await cdnService.uploadImage(
+            req.file.buffer,
+            req.file.originalname,
+            'PROFILE'
+        );
+        try {
+            if (user.avatarId) {
+              if (await cdnService.checkFileExists(user.avatarId)) {
+                await cdnService.deleteFile(user.avatarId);
+              }
+            }
+        } catch (error) {
+            logger.error('Error deleting old avatar from CDN:', error);
+        }
+
+        const primaryAvatarUrl = gif
+            ? (result.urls.original_animated ?? result.urls.original)
+            : result.urls.original;
+
+        // Update user's avatar information
+        await User.update(
+            {
+                avatarUrl: primaryAvatarUrl,
+                avatarId: result.fileId,
+                avatarIsGif: gif,
+            },
+            {where: {id: user.id}}
+        );
+
+        // Invalidate user-specific cache
+        await CacheInvalidation.invalidateUser(user.id);
+
+        return res.json({
+            message: 'Avatar uploaded successfully',
+            avatarIsGif: gif,
+            avatar: {
+                id: result.fileId,
+                urls: result.urls,
+            }
+        });
+    } catch (error) {
+        if (error instanceof CdnError) {
+            return respondWithCdnError(res, error);
+        }
+
+        return res.status(500).json({
+            error: error instanceof Error ? error.message : 'Failed to upload avatar',
+            code: 'SERVER_ERROR',
+        });
+    }
+  }
+);
+
+// Remove avatar
+router.delete(
+  '/avatar',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'deleteProfileAvatar',
+    summary: 'Remove avatar',
+    description: 'Remove the current user profile avatar',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Avatar removed', schema: successMessageSchema },
+      400: { description: 'No avatar to remove', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+        const user = req.user;
+        if (!user) {
+            return res.status(401).json({error: 'User not authenticated'});
+        }
+
+        if (!user.avatarId) {
+            return res.status(400).json({error: 'No avatar to remove'});
+        }
+
+        // Store the avatar ID before clearing it
+        const oldAvatarId = user.avatarId;
+
+        // Update user's avatar information first
+        await User.update(
+            {
+                avatarUrl: null,
+                avatarId: null,
+                avatarIsGif: false,
+            },
+            {where: {id: user.id}}
+        );
+
+        // Delete from CDN after updating user record
+        try {
+            await cdnService.deleteFile(oldAvatarId);
+        } catch (error) {
+            // Log the error but don't fail the request since user record is already updated
+            logger.error('Error deleting old avatar from CDN:', error);
+        }
+
+        // Invalidate user-specific cache
+        await CacheInvalidation.invalidateUser(user.id);
+
+        return res.json({message: 'Avatar removed successfully'});
+    } catch (error) {
+        logger.error('Error removing avatar:', error);
+        return res.status(500).json({error: 'Failed to remove avatar'});
+    }
+  }
+);
+
+// --- Profile banner (preset + custom CDN) ---
+
+router.patch(
+  '/player/banner-preset',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'patchProfilePlayerBannerPreset',
+    summary: 'Update player profile banner preset',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Updated' },
+      400: { description: 'Invalid preset', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+      const body = req.body as { preset?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'preset')) {
+        return res.status(400).json({ error: 'Request body must include preset (string or null)' });
+      }
+      let preset: string | null;
+      try {
+        preset = parseBannerPresetForStorage(body?.preset);
+      } catch {
+        return res.status(400).json({ error: 'Invalid banner preset' });
+      }
+
+      const result = await setBannerPresetForEntity('player', user.playerId, preset);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      logger.error('Error updating player banner preset:', error);
+      return res.status(500).json({ error: 'Failed to update banner preset' });
+    }
+  },
+);
+
+router.delete(
+  '/player/banner-preset',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'deleteProfilePlayerBannerPreset',
+    summary: 'Clear player profile banner preset',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Cleared' },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const result = await clearBannerPresetForEntity('player', user.playerId);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      logger.error('Error clearing player banner preset:', error);
+      return res.status(500).json({ error: 'Failed to clear banner preset' });
+    }
+  },
+);
+
+router.patch(
+  '/player/bio',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'patchProfilePlayerBio',
+    summary: 'Update my player bio',
+    description:
+      'Requires an authenticated user with `playerId` set. Updates that player row only.',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    requestBody: {
+      description: 'Bio text (string or null). Empty string clears.',
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          bio: { type: 'string', nullable: true },
+        },
+        required: ['bio'],
+      },
+    },
+    responses: {
+      200: { description: 'Updated bio' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!user.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const body = req.body as { bio?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'bio')) {
+        return res.status(400).json({ error: 'Request body must include bio (string or null)' });
+      }
+
+      let nextBio: string | null;
+      if (body.bio == null) {
+        nextBio = null;
+      } else if (typeof body.bio === 'string') {
+        const trimmed = body.bio.trim();
+        if (trimmed.length > 2000) {
+          return res.status(400).json({ error: 'Bio must be at most 2000 characters' });
+        }
+        nextBio = trimmed.length ? trimmed : null;
+      } else {
+        return res.status(400).json({ error: 'Bio must be a string or null' });
+      }
+
+      const result = await patchPlainBioForEntity('player', user.playerId, nextBio);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      logger.error('[PATCH /auth/profile/player/bio] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update player bio',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.post(
+  '/player/banner-custom',
+  Auth.tufStellarUser(),
+  upload.single('banner'),
+  ApiDoc({
+    operationId: 'postProfilePlayerBannerCustom',
+    summary: 'Upload custom player profile banner',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Uploaded' },
+      400: { description: 'No file or CDN error', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!CUSTOM_PROFILE_BANNERS_ENABLED) {
+        return res.status(403).json({ error: 'Custom profile banners are temporarily disabled' });
+      }
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
+      }
+
+      const uploaded = await uploadCustomBannerForEntity('player', user.playerId, req.file);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(uploaded);
+    } catch (error) {
+      if (error instanceof CdnError) {
+        return respondWithCdnError(res, error);
+      }
+      logger.error('Error uploading player banner:', error);
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to upload banner',
+      });
+    }
+  },
+);
+
+router.delete(
+  '/player/banner-custom',
+  Auth.tufStellarUser(),
+  ApiDoc({
+    operationId: 'deleteProfilePlayerBannerCustom',
+    summary: 'Remove custom player profile banner',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Removed' },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!CUSTOM_PROFILE_BANNERS_ENABLED) {
+        return res.status(403).json({ error: 'Custom profile banners are temporarily disabled' });
+      }
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const cleared = await clearCustomBannerForEntity('player', user.playerId);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(cleared);
+    } catch (error) {
+      logger.error('Error removing player banner:', error);
+      return res.status(500).json({ error: 'Failed to remove custom banner' });
+    }
+  },
+);
+
+// --- Profile header surface (gradient stack + optional CDN background) ---
+
+router.patch(
+  '/player/header-surface-style',
+  Auth.tufStellarUser(),
+  ApiDoc({
+    operationId: 'patchProfilePlayerHeaderSurfaceStyle',
+    summary: 'Update player profile header card surface style',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Updated' },
+      400: { description: 'Invalid style', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!CUSTOM_PROFILE_BANNERS_ENABLED) {
+        return res.status(403).json({ error: 'Profile header customization is temporarily disabled' });
+      }
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const body = req.body as { style?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'style')) {
+        return res.status(400).json({ error: 'Request body must include style (object or null)' });
+      }
+
+      let parsed: ProfileHeaderSurfaceStyle | null;
+      try {
+        parsed = parseProfileHeaderSurfaceStyle(body.style);
+      } catch (err) {
+        const msg =
+          err instanceof ProfileHeaderSurfaceStyleError ? err.message : 'Invalid header surface style';
+        return res.status(400).json({ error: msg });
+      }
+
+      const updated = await patchHeaderSurfaceStyleForEntity('player', user.playerId, parsed);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(updated);
+    } catch (error) {
+      logger.error('Error updating player header surface style:', error);
+      return res.status(500).json({ error: 'Failed to update header surface style' });
+    }
+  },
+);
+
+router.post(
+  '/player/header-surface-image',
+  Auth.tufStellarUser(),
+  upload.single('image'),
+  ApiDoc({
+    operationId: 'postProfilePlayerHeaderSurfaceImage',
+    summary: 'Upload player profile header surface background image',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Uploaded' },
+      400: { description: 'No file or CDN error', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!CUSTOM_PROFILE_BANNERS_ENABLED) {
+        return res.status(403).json({ error: 'Profile header customization is temporarily disabled' });
+      }
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
+      }
+
+      const layerId = parseHeaderSurfaceLayerId(req);
+      if (!layerId) {
+        return res.status(400).json({ error: 'layerId is required' });
+      }
+
+      try {
+        const uploaded = await uploadHeaderSurfaceImageForEntity(
+          'player',
+          user.playerId,
+          layerId,
+          req.file,
+        );
+        await CacheInvalidation.invalidateUser(user.id);
+        return res.json({ layerId, ...uploaded });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to upload header surface image';
+        if (msg.includes('layerId') || msg.includes('Save header surface')) {
+          return res.status(400).json({ error: msg });
+        }
+        throw err;
+      }
+    } catch (error) {
+      if (error instanceof CdnError) {
+        return respondWithCdnError(res, error);
+      }
+      logger.error('Error uploading player header surface image:', error);
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to upload header surface image',
+      });
+    }
+  },
+);
+
+router.delete(
+  '/player/header-surface-image',
+  Auth.tufStellarUser(),
+  ApiDoc({
+    operationId: 'deleteProfilePlayerHeaderSurfaceImage',
+    summary: 'Remove player profile header surface background image',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Removed' },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!CUSTOM_PROFILE_BANNERS_ENABLED) {
+        return res.status(403).json({ error: 'Profile header customization is temporarily disabled' });
+      }
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const layerId = parseHeaderSurfaceLayerId(req);
+      if (!layerId) {
+        return res.status(400).json({ error: 'layerId is required' });
+      }
+
+      const removed = await deleteHeaderSurfaceImageForEntity('player', user.playerId, layerId);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json({ layerId, ...removed });
+    } catch (error) {
+      logger.error('Error removing player header surface image:', error);
+      return res.status(500).json({ error: 'Failed to remove header surface image' });
+    }
+  },
+);
+
+// Schedule account deletion (3-day grace period)
+router.post(
+  '/me/delete',
+  Auth.user(),
+  stepUpGrantService.requireStepUp('security'),
+  ApiDoc({
+    operationId: 'postProfileDeleteMe',
+    summary: 'Schedule account deletion',
+    description:
+      'Schedules account deletion with a 3-day grace period. Immediately hides the player from the leaderboard. Requires recent step-up confirmation.',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: {
+        description: 'Deletion scheduled',
+        schema: {
+          type: 'object',
+          properties: {
+            message: { type: 'string' },
+            deletionScheduledAt: { type: 'string' },
+            deletionExecuteAt: { type: 'string' },
+          },
+        },
+      },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'User not authenticated' });
+
+      const body = (req.body || {}) as { deletionIncludeCreator?: boolean };
+      const deletionIncludeCreator = Boolean(body.deletionIncludeCreator);
+
+      const { deletionScheduledAt, deletionExecuteAt } =
+        await accountDeletionService.scheduleDeletion(user.id, { deletionIncludeCreator });
+
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json({
+        message: 'Account deletion scheduled',
+        deletionScheduledAt: deletionScheduledAt.toISOString(),
+        deletionExecuteAt: deletionExecuteAt.toISOString(),
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg === 'No linked creator profile to include in deletion') {
+        return res.status(400).json({ error: msg });
+      }
+      logger.error('Error scheduling account deletion:', error);
+      return res.status(500).json({ error: 'Failed to schedule account deletion' });
+    }
+  },
+);
+
+// Cancel scheduled account deletion
+router.post(
+  '/me/delete/cancel',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'postProfileCancelDeleteMe',
+    summary: 'Cancel account deletion',
+    description:
+      'Cancels a scheduled account deletion and restores permission flags and leaderboard ban state safely.',
+    tags: ['Profile'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Deletion canceled', schema: successMessageSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'User not authenticated' });
+
+      await accountDeletionService.cancelDeletion(user.id);
+
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json({ message: 'Account deletion canceled' });
+    } catch (error) {
+      logger.error('Error canceling account deletion:', error);
+      return res.status(500).json({ error: 'Failed to cancel account deletion' });
+    }
+  },
+);
+
+export default router;

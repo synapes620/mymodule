@@ -1,0 +1,119 @@
+function normalizeFileId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Minimal `referencedLevel` payload for pack tree UI (LevelCard pack mode + creator line).
+ * Omits ES/MySQL bloat (level aliases, full song objects, nested search fields, etc.).
+ *
+ * Input must be an **already-decoded** level object — either a Sequelize `referencedLevel`
+ * (e.g. PUT /packs/:id/tree response) or an ES hit run through `convertLevelSearchHit`.
+ * Creator rows include only `name` (no creator alias lists).
+ */
+export function pruneMysqlReferencedLevelForPack(
+  level: Record<string, unknown> | null | undefined
+): Record<string, unknown> | null {
+  if (!level || typeof level.id !== 'number') {
+    return null;
+  }
+
+  const rating = level.rating as Record<string, unknown> | undefined;
+  const ratingOut =
+    rating && rating.averageDifficultyId != null
+      ? { averageDifficultyId: rating.averageDifficultyId }
+      : undefined;
+
+  const tagsRaw = level.tags as unknown[] | undefined;
+  const tags = Array.isArray(tagsRaw)
+    ? (tagsRaw
+        .map((t) => {
+          const row = t as Record<string, unknown>;
+          return row?.id != null ? { id: row.id } : null;
+        })
+        .filter(Boolean) as { id: unknown }[])
+    : [];
+
+  const curationsRaw = level.curations as unknown[] | undefined;
+  const curations = Array.isArray(curationsRaw)
+    ? (curationsRaw
+        .map((c) => {
+          const row = c as Record<string, unknown>;
+          if (row?.id == null) return null;
+          const types = row.types as { id: number }[] | undefined;
+          const typeIds = Array.isArray(types)
+            ? types.map((t) => t.id).filter((id) => typeof id === 'number' && Number.isFinite(id))
+            : Array.isArray(row.typeIds)
+              ? (row.typeIds as number[]).filter((id) => typeof id === 'number' && Number.isFinite(id))
+              : [];
+          const themeTypeId =
+            typeof row.themeTypeId === 'number' && Number.isFinite(row.themeTypeId)
+              ? row.themeTypeId
+              : undefined;
+          return { id: row.id, typeIds, ...(themeTypeId != null ? { themeTypeId } : {}) };
+        })
+        .filter(Boolean) as Record<string, unknown>[])
+    : [];
+
+  const lcRaw = level.levelCredits as unknown[] | undefined;
+  const levelCredits = Array.isArray(lcRaw)
+    ? lcRaw.map((cr) => {
+        const row = cr as Record<string, unknown>;
+        const c = row?.creator as Record<string, unknown> | null | undefined;
+        return {
+          role: row.role,
+          creator: c ? { name: c.name != null ? String(c.name) : '' } : null,
+        };
+      })
+    : [];
+
+  const songObj = level.songObject as Record<string, unknown> | null | undefined;
+  const songObject =
+    songObj && songObj.id != null
+      ? { id: songObj.id, name: songObj.name != null ? String(songObj.name) : '' }
+      : null;
+
+  const artistsRaw = level.artists as unknown[] | undefined;
+  const artists = Array.isArray(artistsRaw)
+    ? artistsRaw.map((a) => ({
+        name: String((a as Record<string, unknown>)?.name ?? ''),
+      }))
+    : null;
+
+  const teamObject = level.teamObject as Record<string, unknown> | null | undefined;
+  const teamStr =
+    (typeof level.team === 'string' && level.team) ||
+    (teamObject?.name != null ? String(teamObject.name) : null);
+
+  return {
+    _packViewMinimal: true,
+    id: level.id,
+    diffId: level.diffId,
+    tilecount: level.tilecount,
+    bpm: level.bpm,
+    levelLengthInMs: level.levelLengthInMs,
+    baseScore: level.baseScore,
+    song: level.song,
+    artist: level.artist,
+    suffix: level.suffix ?? null,
+    songId: level.songId ?? null,
+    songObject,
+    artists,
+    team: teamStr,
+    levelCredits,
+    tags,
+    curations,
+    rating: ratingOut,
+    fileId: normalizeFileId(level.fileId),
+    videoLink: level.videoLink,
+    dlLink: level.dlLink,
+    workshopLink: level.workshopLink,
+    ws: level.ws,
+    clears: level.clears,
+    uniqueClears: level.uniqueClears,
+    likes: level.likes,
+    isDeleted: level.isDeleted,
+    isHidden: level.isHidden,
+  };
+}

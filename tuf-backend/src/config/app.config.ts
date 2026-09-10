@@ -1,0 +1,319 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+/** Parses env numbers; invalid or empty strings fall back to `defaultValue`. */
+export function parseEnvNumber(raw: string | undefined, defaultValue: number): number {
+  if (raw === undefined || raw === '') return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : defaultValue;
+}
+
+export type CommunityTagConfig = {
+  wilsonZ: number;
+  scoreOn: number;
+  scoreOff: number;
+  cardCap: number;
+  clearerWeight: number;
+  defaultWeight: number;
+};
+
+export function getCommunityTagConfig(): CommunityTagConfig {
+  return {
+    wilsonZ: parseEnvNumber(process.env.COMMUNITY_TAG_WILSON_Z, 4),
+    scoreOn: parseEnvNumber(process.env.COMMUNITY_TAG_SCORE_ON, 0.45),
+    scoreOff: parseEnvNumber(process.env.COMMUNITY_TAG_SCORE_OFF, 0.35),
+    cardCap: Math.max(0, Math.floor(parseEnvNumber(process.env.COMMUNITY_TAG_CARD_CAP, 7))),
+    clearerWeight: Math.max(1, Math.floor(parseEnvNumber(process.env.COMMUNITY_TAG_CLEARER_WEIGHT, 10))),
+    defaultWeight: Math.max(1, Math.floor(parseEnvNumber(process.env.COMMUNITY_TAG_DEFAULT_WEIGHT, 1))),
+  };
+}
+
+/** Parses env booleans; unknown strings fall back to `defaultValue`. */
+export function parseEnvBool(raw: string | undefined, defaultValue: boolean): boolean {
+  if (raw === undefined || raw === '') return defaultValue;
+  const s = raw.trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'on') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'off') return false;
+  return defaultValue;
+}
+
+/**
+ * When false (default if `TUF_STELLAR_ENABLED` unset), TUFStellar billing APIs, webhook grants,
+ * and public stellar perks are disabled. Set `TUF_STELLAR_ENABLED=true` to enable.
+ */
+export function isTufStellarFeatureEnabled(): boolean {
+  return parseEnvBool(process.env.TUF_STELLAR_ENABLED, false);
+}
+
+export const YOUTUBE_CHANNEL_LINKING_DISABLED = 'YOUTUBE_CHANNEL_LINKING_DISABLED';
+
+/**
+ * YouTube channel OAuth linking (`youtube.readonly`). Off by default while the
+ * sensitive-scope verification is pending. Set `YOUTUBE_CHANNEL_LINKING_ENABLED=true`
+ * to expose settings, profile buttons, and link/unlink routes.
+ */
+export function isYoutubeChannelLinkingEnabled(): boolean {
+  return parseEnvBool(process.env.YOUTUBE_CHANNEL_LINKING_ENABLED, false);
+}
+
+export function youtubeChannelLinkingDisabledPayload(): {
+  error: string;
+  code: typeof YOUTUBE_CHANNEL_LINKING_DISABLED;
+} {
+  return {
+    error: 'YouTube channel linking is temporarily unavailable',
+    code: YOUTUBE_CHANNEL_LINKING_DISABLED,
+  };
+}
+
+/** Master kill switch for Web Push. Requires VAPID keys as well. */
+export function isPushNotificationsEnabled(): boolean {
+  return parseEnvBool(process.env.PUSH_NOTIFICATIONS_ENABLED, false);
+}
+
+export function getVapidConfig(): {
+  publicKey: string;
+  privateKey: string;
+  subject: string;
+} | null {
+  const publicKey = (process.env.VAPID_PUBLIC_KEY ?? '').trim();
+  const privateKey = (process.env.VAPID_PRIVATE_KEY ?? '').trim();
+  if (!publicKey || !privateKey) return null;
+  const subject =
+    (process.env.VAPID_SUBJECT ?? '').trim() || 'mailto:noreply@tuforums.com';
+  return {publicKey, privateKey, subject};
+}
+
+export function isPushAvailable(): boolean {
+  return isPushNotificationsEnabled() && getVapidConfig() !== null;
+}
+
+/**
+ * When set, every announcement webhook send uses this URL instead of the configured
+ * channel / rerate hook URLs. Delivery tracking still keys off the original URLs.
+ * Example: a personal Discord webhook for safe local testing.
+ */
+export function getDiscordAnnouncementWebhookOverride(): string | null {
+  const raw = (process.env.DISCORD_ANNOUNCEMENT_WEBHOOK_OVERRIDE || '').trim();
+  return raw.length > 0 ? raw : null;
+}
+
+/**
+ * Resolve the URL used for the actual HTTP send (override wins when set).
+ */
+export function resolveDiscordAnnouncementWebhookUrl(originalUrl: string): string {
+  return getDiscordAnnouncementWebhookOverride() || originalUrl;
+}
+
+/**
+ * Batch announcement webhooks (levels / rerates / passes) are logged only in development
+ * so local runs do not post to production Discord channels.
+ * Set `DISCORD_ANNOUNCEMENT_DELIVERY_FORCE=true` to send from development anyway.
+ * Setting `DISCORD_ANNOUNCEMENT_WEBHOOK_OVERRIDE` also enables delivery (to the override URL).
+ */
+export function shouldDeliverDiscordAnnouncementWebhooks(): boolean {
+  if (getDiscordAnnouncementWebhookOverride()) {
+    return true;
+  }
+  if (process.env.NODE_ENV === 'development') {
+    return parseEnvBool(process.env.DISCORD_ANNOUNCEMENT_DELIVERY_FORCE, false);
+  }
+  return true;
+}
+
+export const clientUrlEnv =
+  process.env.NODE_ENV === 'production'
+    ? process.env.PROD_CLIENT_URL
+    : process.env.NODE_ENV === 'staging'
+      ? process.env.STAGING_CLIENT_URL
+      : process.env.NODE_ENV === 'development'
+        ? process.env.CLIENT_URL
+        : 'http://localhost:5173';
+
+export const port =
+  process.env.NODE_ENV === 'production'
+    ? process.env.PROD_PORT
+    : process.env.NODE_ENV === 'staging'
+      ? process.env.STAGING_PORT
+      : process.env.NODE_ENV === 'development'
+        ? process.env.PORT
+        : '3002';
+
+export const ownUrl =
+  process.env.NODE_ENV === 'production'
+    ? process.env.PROD_API_URL
+    : process.env.NODE_ENV === 'staging'
+      ? process.env.STAGING_API_URL
+      : process.env.NODE_ENV === 'development'
+        ? process.env.DEV_URL
+        : 'http://localhost:3002';
+
+function resolveStripeCheckoutSuccessUrl(): string {
+  const explicit = (process.env.STRIPE_CHECKOUT_SUCCESS_URL ?? '').trim();
+  const env = process.env.NODE_ENV;
+  if (env === 'production' || env === 'staging') {
+    return explicit;
+  }
+  const base = String(clientUrlEnv || 'http://localhost:5173').replace(/\/$/, '');
+  return `${base}/callback?billing=stripe&session_id={CHECKOUT_SESSION_ID}`;
+}
+
+function resolveStripeCheckoutCancelUrl(): string {
+  const explicit = (process.env.STRIPE_CHECKOUT_CANCEL_URL ?? '').trim();
+  const env = process.env.NODE_ENV;
+  if (env === 'production' || env === 'staging') {
+    return explicit;
+  }
+  const base = String(clientUrlEnv || 'http://localhost:5173').replace(/\/$/, '');
+  return `${base}/settings/billing`;
+}
+
+/** Stripe Price IDs (`price_…`) for TUFStellar one-time terms; from Dashboard one-time prices. */
+export interface StripeTufStellarPriceIds {
+  m1: string;
+  m2: string;
+  m3: string;
+  m6: string;
+  m9: string;
+  m12: string;
+}
+
+function readStripeTufStellarPriceIds(): StripeTufStellarPriceIds {
+  const jsonRaw = (process.env.STRIPE_TUFSTELLAR_PRICE_IDS ?? '').trim();
+  if (jsonRaw) {
+    try {
+      const o = JSON.parse(jsonRaw) as Record<string, string>;
+      const pick = (k: string) => String(o[k] ?? '').trim();
+      return {
+        m1: pick('1'),
+        m2: pick('2'),
+        m3: pick('3'),
+        m6: pick('6'),
+        m9: pick('9'),
+        m12: pick('12'),
+      };
+    } catch {
+      /* fall through to discrete env vars */
+    }
+  }
+  return {
+    m1: (process.env.STRIPE_PRICE_TUFSTELLAR_1M ?? '').trim(),
+    m2: (process.env.STRIPE_PRICE_TUFSTELLAR_2M ?? '').trim(),
+    m3: (process.env.STRIPE_PRICE_TUFSTELLAR_3M ?? '').trim(),
+    m6: (process.env.STRIPE_PRICE_TUFSTELLAR_6M ?? '').trim(),
+    m9: (process.env.STRIPE_PRICE_TUFSTELLAR_9M ?? '').trim(),
+    m12: (process.env.STRIPE_PRICE_TUFSTELLAR_12M ?? '').trim(),
+  };
+}
+
+export interface StripeConfig {
+  secretKey: string;
+  webhookSecret: string;
+  checkoutSuccessUrl: string;
+  checkoutCancelUrl: string;
+  tufStellarPriceIds: StripeTufStellarPriceIds;
+}
+
+export const stripeConfig: StripeConfig = {
+  secretKey: (process.env.STRIPE_SECRET_KEY ?? '').trim(),
+  webhookSecret: (process.env.STRIPE_WEBHOOK_SECRET ?? '').trim(),
+  checkoutSuccessUrl: resolveStripeCheckoutSuccessUrl(),
+  checkoutCancelUrl: resolveStripeCheckoutCancelUrl(),
+  tufStellarPriceIds: readStripeTufStellarPriceIds(),
+};
+
+const corsOriginAllowlist = new Set(
+  [
+    clientUrlEnv || 'http://localhost:5173',
+    'http://localhost:5173',
+    'http://localhost:5000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5000',
+    'https://tuforums.com',
+    'https://www.tuforums.com',
+    'https://api.tuforums.com',
+    'https://tufstaging.online',
+    'https://api.tufstaging.online',
+    'https://web-adofai.impl1113.dev',
+  ]
+    .concat(
+      (process.env.CORS_EXTRA_ORIGINS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+    .filter(Boolean),
+);
+
+const loopbackOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
+/** Whether the browser Origin may use credentialed CORS against this API. */
+export function isAllowedCorsOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  if (corsOriginAllowlist.has(origin)) return true;
+  // Any loopback origin (any port) — local OAuth / app testing against prod or staging.
+  if (loopbackOriginPattern.test(origin)) return true;
+  return false;
+}
+
+export const corsOptions = {
+  origin: (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void,
+  ) => {
+    if (isAllowedCorsOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+    // Reject without throwing — avoids 500s from extension origins (chrome-extension://…)
+    callback(null, false);
+  },
+  methods: [
+    'GET',
+    'POST',
+    'PUT',
+    'DELETE',
+    'OPTIONS',
+    'PATCH',
+    'HEAD',
+    'CONNECT',
+    'TRACE',
+  ],
+  credentials: true,
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+    'Expires',
+    'Last-Event-ID',
+    'X-Form-Type',
+    'X-Super-Admin-Proof',
+    'X-File-Id',
+    'X-Chunk-Index',
+    'X-Total-Chunks',
+    'If-None-Match',
+    'If-Modified-Since',
+    'X-CSRF-Token',
+    // Sentry browser tracing (tracePropagationTargets → api.tuforums.com)
+    'baggage',
+    'sentry-trace',
+  ],
+  exposedHeaders: [
+    'Content-Type',
+    'Content-Length',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+    'Expires',
+    'Last-Event-ID',
+    'X-Form-Type',
+    'X-File-Id',
+    'X-Chunk-Index',
+    'X-Total-Chunks',
+    'ETag',
+    'Last-Modified',
+    'X-CSRF-Token',
+  ],
+};

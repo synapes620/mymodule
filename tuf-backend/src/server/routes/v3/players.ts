@@ -1,0 +1,1417 @@
+import { Router, Request, Response } from 'express';
+import { Auth } from '@/server/middleware/auth.js';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import {
+  idParamSpec,
+  errorResponseSchema,
+  standardErrorResponses404500,
+  standardErrorResponses500,
+  standardErrorResponses401404500,
+} from '@/server/schemas/common.js';
+import { validSortOptions } from '@/config/constants.js';
+import ElasticsearchService from '@/server/services/elasticsearch/ElasticsearchService.js';
+import {
+  getPlayerRanks,
+  getPlayerMaxFields,
+  getRankedScoreRanksForHits,
+  parsePlayerFlagFilter,
+  PlayerSearchOptions,
+} from '@/server/services/elasticsearch/search/players/playerSearch.js';
+import { PlayerStatsService } from '@/server/services/core/PlayerStatsService.js';
+import { computePlayerFunFacts } from '@/server/services/stats/playerFunFacts.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { PaginationQuery } from '@/server/interfaces/models/index.js';
+import Player from '@/models/players/Player.js';
+import PlayerAlias from '@/models/players/PlayerAlias.js';
+import { Cache, CacheInvalidation } from '@/server/middleware/cache.js';
+import { createRateLimiter } from '@/server/decorators/rateLimiter.js';
+import { normalizeTufStellarIconVariant } from '@/misc/utils/subscriptions/tufStellarSubscription.js';
+import { isTufStellarFeatureEnabled, isYoutubeChannelLinkingEnabled } from '@/config/app.config.js';
+import { DEFAULT_LEADERBOARD_RANK_SCORING_VERSION, RANK_HISTORY_MAX_POINTS } from '@/config/leaderboardRankHistory.js';
+import {
+  buildRankHistorySeries,
+  getPeakRankedScoreRank,
+} from '@/server/services/leaderboard/rankHistorySeries.js';
+import {
+  fetchHistoricalLeaderboardAtDate,
+  fetchHistoricalLeaderboardBounds,
+  hydrateHistoricalLeaderboardPlayers,
+  type HistoricalLeaderboardMetric,
+} from '@/server/services/leaderboard/historicalLeaderboardAtDate.js';
+import { multerMemoryCdnImage10Mb as upload } from '@/config/multerMemoryUploads.js';
+import cdnService from '@/server/services/core/CdnService.js';
+import { CdnError, respondWithCdnError } from '@/server/services/core/CdnService.js';
+import {
+  BioCanvasProfileError,
+  parseBioCanvasBlockId,
+  patchBioCanvasForProfile,
+  patchPlainBioForEntity,
+  serializeBioCanvasApiFields,
+  uploadBioCanvasImageForProfile,
+} from '@/server/services/bioCanvasProfile.js';
+import { setStellarIconVariantForEntity } from '@/server/services/profileCustomization/presentationMutations.js';
+import {PlacementUtilizationService} from '@/server/services/tournaments/PlacementUtilizationService.js';
+import {
+  assemblePresentationForPlayer,
+  getPresentationSyncForUser,
+  ProfileCustomizationError,
+} from '@/server/services/profileCustomization/ProfileCustomizationService.js';
+import {
+  getProfileModulesApiPayload,
+  saveProfileModulesForEntity,
+} from '@/server/services/profileCustomization/profileModulesService.js';
+import {
+  coerceShowFollowerCount,
+  followFieldsForProfile,
+  handleFollowersGet,
+  handleFollowPut,
+  profileFollowLimiter,
+} from '@/server/services/notifications/followHttp.js';
+import {
+  parseFollowingQueryParam,
+  resolveFollowingLeaderboardFilter,
+} from '@/server/services/notifications/FollowService.js';
+import { youtubeChannelService } from '@/server/services/accounts/YouTubeChannelService.js';
+
+/**
+ * v3 players routes — Elasticsearch-backed.
+ *
+ * Response shapes are flat (no legacy PlayerStats / Player wrapping) and stable.
+ * Ranks are computed on-demand per request (5 parallel ES count queries).
+ */
+
+const router: Router = Router();
+const elasticsearchService = ElasticsearchService.getInstance();
+const playerStatsService = PlayerStatsService.getInstance();
+
+const DEFAULT_LIMIT = 30;
+const MAX_LIMIT = 100;
+
+/** Public endpoint; cheap to spam and each miss is a multi-second board rebuild. */
+const leaderboardHistoryLimiter = createRateLimiter({
+  type: 'leaderboard_history',
+  windowMs: 60 * 1000,
+  maxAttempts: 40,
+  blockDuration: 2 * 60 * 1000,
+  failClosed: false,
+});
+
+function parseLimit(raw: unknown, fallback = DEFAULT_LIMIT): number {
+  const n = parseInt(String(raw ?? ''), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(MAX_LIMIT, Math.max(1, n));
+}
+
+function parseOffset(raw: unknown): number {
+  const n = parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function parseFilters(raw: unknown): Record<string, any> | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, any>;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Search players by text/Discord prefix. Flat shape; no ranks computed for speed.
+ *
+ * Query params: query, limit (<=100), offset, flagField, flagMode, showBanned (deprecated), filters (JSON).
+ */
+router.get(
+  '/search',
+  ApiDoc({
+    operationId: 'v3GetPlayersSearch',
+    summary: 'Search players (v3)',
+    description:
+      'Elasticsearch-backed player search. Accepts text, `pid:playerId` (profile URL shortcut), `#discordId`, or `@discordUsername` via the `query` param. Returns a flat list sorted by relevance.',
+    tags: ['Database', 'Players', 'v3'],
+    query: {
+      query: { schema: { type: 'string' } },
+      limit: { schema: { type: 'string' } },
+      offset: { schema: { type: 'string' } },
+      showBanned: { schema: { type: 'string' } },
+      flagField: { schema: { type: 'string' } },
+      flagMode: { schema: { type: 'string' } },
+      filters: { schema: { type: 'string' } },
+      excludeCreatorLinked: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Paginated search results' },
+      ...standardErrorResponses500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const query = String(req.query.query ?? '').trim();
+      const limit = parseLimit(req.query.limit);
+      const offset = parseOffset(req.query.offset);
+      const { field: flagField, mode: flagMode } = parsePlayerFlagFilter({
+        flagField: req.query.flagField,
+        flagMode: req.query.flagMode,
+        showBanned: req.query.showBanned,
+        defaultMode: 'hide',
+      });
+      const filters = parseFilters(req.query.filters);
+      const excludeCreatorLinked = String(req.query.excludeCreatorLinked ?? '') === 'true';
+
+      const options: PlayerSearchOptions = {
+        rawQuery: query || undefined,
+        flagField,
+        flagMode,
+        filters,
+        limit,
+        offset,
+        excludeCreatorLinked,
+      };
+
+      const { total, hits } = await elasticsearchService.searchPlayers(options);
+      return res.json({ total, results: hits, limit, offset });
+    } catch (error) {
+      logger.error('[v3 /players/search] failure', error);
+      return res.status(500).json({
+        error: 'Failed to search players',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Paginated leaderboard with sort / filters / text query. ES-backed.
+ *
+ * Query params: query, sortBy, order, flagField, flagMode, showBanned (deprecated), limit, offset, filters, page (accepted for compat).
+ */
+router.get(
+  '/leaderboard',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'v3GetLeaderboard',
+    summary: 'Player leaderboard (v3)',
+    description:
+      'Elasticsearch-backed leaderboard. Supports sort, numeric range filters, country filter, player moderation flag filter (`flagField` + `flagMode`), text/Discord query (`pid:playerId`/`#discordId`/`@username`), and optional `following=true` (authenticated) to restrict to players the viewer follows. Returns `maxFields` aggregations for UI filter ceilings.',
+    tags: ['Database', 'Leaderboard', 'v3'],
+    query: {
+      sortBy: { schema: { type: 'string' } },
+      order: { schema: { type: 'string' } },
+      showBanned: { schema: { type: 'string' } },
+      flagField: { schema: { type: 'string' } },
+      flagMode: { schema: { type: 'string' } },
+      query: { schema: { type: 'string' } },
+      offset: { schema: { type: 'string' } },
+      limit: { schema: { type: 'string' } },
+      filters: { schema: { type: 'string' } },
+      following: { schema: { type: 'string' } },
+      page: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Leaderboard results' },
+      400: { schema: errorResponseSchema },
+      401: { schema: errorResponseSchema },
+      ...standardErrorResponses500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const { page, offset, limit } = req.query as unknown as PaginationQuery;
+      const sortBy = (req.query.sortBy as string) || 'rankedScore';
+      const order = ((req.query.order as string) || 'desc').toLowerCase();
+      const { field: flagField, mode: flagMode } = parsePlayerFlagFilter({
+        flagField: req.query.flagField,
+        flagMode: req.query.flagMode,
+        showBanned: req.query.showBanned,
+        defaultMode: 'show',
+      });
+      const rawQuery = (req.query.query as string) || undefined;
+      const filters = parseFilters(req.query.filters);
+
+      if (!validSortOptions.includes(sortBy)) {
+        return res.status(400).json({
+          error: `Invalid sortBy option. Valid options are: ${validSortOptions.join(', ')}`,
+        });
+      }
+
+      const effectiveLimit = parseLimit(limit);
+      const effectiveOffset = parseOffset(offset);
+
+      const followingFilter = await resolveFollowingLeaderboardFilter(
+        req.query.following,
+        req.user?.id,
+        'player',
+      );
+      if (followingFilter.active && followingFilter.unauthorized) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (followingFilter.active && followingFilter.mode === 'only' && followingFilter.ids.length === 0) {
+        const maxFields = await getPlayerMaxFields();
+        return res.json({
+          count: 0,
+          results: [],
+          page,
+          offset: effectiveOffset,
+          limit: effectiveLimit,
+          maxFields,
+        });
+      }
+
+      const options: PlayerSearchOptions = {
+        rawQuery,
+        sortBy,
+        order: order === 'asc' ? 'asc' : 'desc',
+        flagField,
+        flagMode,
+        filters,
+        limit: effectiveLimit,
+        offset: effectiveOffset,
+        requireHasPasses: !rawQuery,
+        ids: followingFilter.active && followingFilter.ids.length > 0 ? followingFilter.ids : undefined,
+        idsMode: followingFilter.active && followingFilter.mode === 'hide' ? 'exclude' : undefined,
+      };
+
+      const [{ total, hits }, maxFields] = await Promise.all([
+        elasticsearchService.searchPlayers(options),
+        getPlayerMaxFields(),
+      ]);
+
+      // Always expose `rankedScoreRank` (and `rank`, its canonical alias) on every
+      // hit: rankedScore is the defining leaderboard metric, so the UI keeps rendering
+      // "#rank" badges even when the user sorts by e.g. generalScore.
+      //
+      // The rank is ALWAYS global (count of non-banned players with strictly greater
+      // rankedScore across the entire index, +1). We must not shortcut to the positional
+      // index even when sorting by rankedScore desc, because any active filter (country,
+      // numeric range, text query, showBanned) narrows the hit set without narrowing the
+      // canonical leaderboard — the positional slot would then point to "#1 within the
+      // filter" instead of the global rank. Batched parallel count queries are cheap
+      // enough (≤ page size, default 30) that we always use them.
+      const rankedScoreRanks = await getRankedScoreRanksForHits(hits);
+
+      const resultsWithRank = hits.map((doc: any, i: number) => ({
+        ...doc,
+        rankedScoreRank: rankedScoreRanks[i],
+        rank: rankedScoreRanks[i],
+      }));
+
+      return res.json({
+        count: total,
+        results: resultsWithRank,
+        page,
+        offset: effectiveOffset,
+        limit: effectiveLimit,
+        maxFields,
+      });
+    } catch (error) {
+      logger.error('[v3 /players/leaderboard] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch leaderboard',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Lightweight date bounds for the past-leaderboard UI (no board rebuild).
+ */
+router.get(
+  '/leaderboard-history/bounds',
+  leaderboardHistoryLimiter.middleware,
+  Cache({
+    ttl: 300,
+    prefix: 'v3:players:leaderboard-history-bounds',
+    varyByQuery: ['scoringVersion'],
+    tags: ['leaderboard-history'],
+  }),
+  ApiDoc({
+    operationId: 'v3GetLeaderboardHistoryBounds',
+    summary: 'Historical leaderboard date bounds (v3)',
+    description:
+      'Returns min/max selectable UTC dates for past leaderboard without reconstructing a board. Prefer this over probing `/leaderboard-history` with a dummy date.',
+    tags: ['Database', 'Leaderboard', 'v3'],
+    query: {
+      scoringVersion: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Date bounds' },
+      429: { description: 'Rate limited' },
+      ...standardErrorResponses500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const scoringVersion =
+        String(req.query.scoringVersion ?? '').trim() || DEFAULT_LEADERBOARD_RANK_SCORING_VERSION;
+      const bounds = await fetchHistoricalLeaderboardBounds(scoringVersion);
+      return res.json({
+        minDate: bounds.minDate,
+        maxDate: bounds.maxDate,
+        scoringVersion,
+      });
+    } catch (error) {
+      logger.error('[v3 /players/leaderboard-history/bounds] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch historical leaderboard bounds',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Rank-only leaderboard reconstructed at a past UTC date from player_leaderboard_rank_events.
+ *
+ * Query params: date (YYYY-MM-DD), metric (rankedScore|generalScore), order (asc|desc),
+ * query (player name), offset, limit, scoringVersion, following.
+ */
+router.get(
+  '/leaderboard-history',
+  leaderboardHistoryLimiter.middleware,
+  Auth.addUserToRequest(),
+  Cache({
+    // Past days are immutable once snapshotted; short TTL still refreshes avatar/name hydration.
+    ttl: 120,
+    prefix: 'v3:players:leaderboard-history',
+    varyByQuery: ['date', 'metric', 'order', 'query', 'offset', 'limit', 'scoringVersion'],
+    tags: ['leaderboard-history'],
+    skipIf: (req) => parseFollowingQueryParam(req.query.following),
+  }),
+  ApiDoc({
+    operationId: 'v3GetLeaderboardHistory',
+    summary: 'Historical player leaderboard (v3)',
+    description:
+      'Rank-only leaderboard as of end-of-day `date` (UTC), reconstructed by forward-filling `player_leaderboard_rank_events`. Hydrates current player names/avatars from Elasticsearch. Supports metric (rankedScore|generalScore), order, name query, pagination, and optional `following=true` (authenticated) to restrict to players the viewer follows. Newest selectable date is yesterday. Rate-limited per IP.',
+    tags: ['Database', 'Leaderboard', 'v3'],
+    query: {
+      date: { schema: { type: 'string' } },
+      metric: { schema: { type: 'string' } },
+      order: { schema: { type: 'string' } },
+      query: { schema: { type: 'string' } },
+      offset: { schema: { type: 'string' } },
+      limit: { schema: { type: 'string' } },
+      scoringVersion: { schema: { type: 'string' } },
+      following: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Historical leaderboard results' },
+      400: { schema: errorResponseSchema },
+      401: { schema: errorResponseSchema },
+      429: { description: 'Rate limited' },
+      ...standardErrorResponses500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const dateRaw = String(req.query.date ?? '').trim();
+      if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(dateRaw)) {
+        return res.status(400).json({ error: 'date must be YYYY-MM-DD (UTC)' });
+      }
+
+      const metricRaw = String(req.query.metric ?? 'rankedScore').trim();
+      if (metricRaw !== 'rankedScore' && metricRaw !== 'generalScore') {
+        return res.status(400).json({
+          error: 'metric must be rankedScore or generalScore',
+        });
+      }
+      const metric = metricRaw as HistoricalLeaderboardMetric;
+
+      const orderRaw = ((req.query.order as string) || 'asc').toLowerCase();
+      const order = orderRaw === 'desc' ? 'desc' : 'asc';
+      const rawQuery = String(req.query.query ?? '').trim();
+      const effectiveLimit = parseLimit(req.query.limit);
+      const effectiveOffset = parseOffset(req.query.offset);
+      const scoringVersion =
+        String(req.query.scoringVersion ?? '').trim() || DEFAULT_LEADERBOARD_RANK_SCORING_VERSION;
+
+      const followingFilter = await resolveFollowingLeaderboardFilter(
+        req.query.following,
+        req.user?.id,
+        'player',
+      );
+      if (followingFilter.active && followingFilter.unauthorized) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (followingFilter.active && followingFilter.mode === 'only' && followingFilter.ids.length === 0) {
+        const bounds = await fetchHistoricalLeaderboardBounds(scoringVersion);
+        return res.json({
+          count: 0,
+          results: [],
+          offset: effectiveOffset,
+          limit: effectiveLimit,
+          minDate: bounds.minDate,
+          maxDate: bounds.maxDate,
+          date: dateRaw,
+          metric,
+          order,
+          scoringVersion,
+        });
+      }
+
+      const board = await fetchHistoricalLeaderboardAtDate({
+        date: dateRaw,
+        metric,
+        order,
+        query: rawQuery || undefined,
+        offset: effectiveOffset,
+        limit: effectiveLimit,
+        scoringVersion,
+        playerIds: followingFilter.active && followingFilter.ids.length > 0 ? followingFilter.ids : undefined,
+        playerIdsMode: followingFilter.active && followingFilter.mode === 'hide' ? 'exclude' : undefined,
+      });
+
+      const results = await hydrateHistoricalLeaderboardPlayers(board.results);
+
+      return res.json({
+        count: board.count,
+        results,
+        offset: effectiveOffset,
+        limit: effectiveLimit,
+        minDate: board.minDate,
+        maxDate: board.maxDate,
+        date: dateRaw,
+        metric,
+        order,
+        scoringVersion,
+      });
+    } catch (error) {
+      logger.error('[v3 /players/leaderboard-history] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch historical leaderboard',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Daily forward-filled rank history (stored deltas expanded server-side).
+ */
+router.get(
+  '/:id([0-9]{1,20})/rank-history',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'v3GetPlayerRankHistory',
+    summary: 'Get player rank history (v3)',
+    description:
+      'Returns forward-filled rank history from append-only `player_leaderboard_rank_events`. With `from`+`to` it returns daily samples (UTC, capped by maxPoints). Without range params it returns full-history weekly samples.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    query: {
+      from: { schema: { type: 'string' } },
+      to: { schema: { type: 'string' } },
+      scoringVersion: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Rank history points' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid player id' });
+      }
+
+      const fromRaw = String(req.query.from ?? '').trim();
+      const toRaw = String(req.query.to ?? '').trim();
+      const hasRange = fromRaw.length > 0 || toRaw.length > 0;
+      if (hasRange) {
+        if (
+          !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(fromRaw) ||
+          !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(toRaw)
+        ) {
+          return res.status(400).json({ error: 'from and to must be YYYY-MM-DD (UTC)' });
+        }
+        if (fromRaw > toRaw) {
+          return res.status(400).json({ error: 'from must be <= to' });
+        }
+      }
+
+      const scoringVersion =
+        String(req.query.scoringVersion ?? '').trim() || DEFAULT_LEADERBOARD_RANK_SCORING_VERSION;
+
+      const doc = await elasticsearchService.getPlayerDocumentById(id);
+      if (!doc) return res.status(404).json({ error: 'Player not found' });
+
+      const series = await buildRankHistorySeries({
+        playerId: id,
+        scoringVersion,
+        ...(hasRange ? { from: fromRaw, to: toRaw } : {}),
+        stepDays: hasRange ? 1 : 7,
+      });
+
+      return res.json({
+        playerId: id,
+        scoringVersion,
+        from: hasRange ? fromRaw : null,
+        to: hasRange ? toRaw : null,
+        sampleStepDays: hasRange ? 1 : 7,
+        maxPoints: RANK_HISTORY_MAX_POINTS,
+        series,
+      });
+    } catch (error) {
+      logger.error('[v3 /players/:id/rank-history] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch rank history',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Get a single player's ES document + on-demand ranks. Fast profile-card endpoint.
+ */
+router.get(
+  '/:id([0-9]{1,20})',
+  ApiDoc({
+    operationId: 'v3GetPlayer',
+    summary: 'Get player (v3)',
+    description:
+      'Fetches the player Elasticsearch document by id and attaches freshly-computed ranks (5 parallel ES count queries).',
+    tags: ['Database', 'Players', 'v3'],
+    params: { id: idParamSpec },
+    responses: {
+      200: { description: 'Player detail' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid player id' });
+      }
+
+      const doc = await elasticsearchService.getPlayerDocumentById(id);
+      if (!doc) return res.status(404).json({ error: 'Player not found' });
+
+      const ranks = await getPlayerRanks(doc);
+      return res.json({ ...doc, ...ranks });
+    } catch (error) {
+      logger.error('[v3 /players/:id] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch player',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Full profile view: ES stats + ranks + DB-enriched passes/topScores/potentialTopScores.
+ * Fun-facts aggregates include hidden passes only when the caller owns the profile
+ * and passes `showHidden=true` (same rule as GET .../passes). The `funFacts.counts.hiddenPasses`
+ * tally is still returned for the owning caller even when `showHidden` is false.
+ */
+router.get(
+  '/:id([0-9]{1,20})/profile',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'v3GetPlayerProfile',
+    summary: 'Get player profile (v3)',
+    description:
+      'Player profile page payload: ES document + on-demand ranks + DB-sourced passes, topScores, and potentialTopScores. `funFacts` aggregates include hidden passes only when the caller owns the profile and `showHidden=true`; `funFacts.counts.hiddenPasses` is always the real hidden-pass count for the owning caller.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    query: {
+      showHidden: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Player profile' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid player id' });
+      }
+
+      const user = req.user;
+      const isOwnProfile = Boolean(user && user.playerId && user.playerId === id);
+      const showHidden = String(req.query.showHidden || '').toLowerCase() === 'true';
+      const includeHiddenInFunFacts = isOwnProfile && showHidden;
+
+      const doc = await elasticsearchService.getPlayerDocumentById(id);
+      if (!doc) return res.status(404).json({ error: 'Player not found' });
+
+      const [ranks, enriched, funFacts, playerRow, presentation, follow, highestRankedScore, profileModulesPayload] =
+        await Promise.all([
+          getPlayerRanks(doc),
+          playerStatsService.getEnrichedPlayer(id, isOwnProfile ? user : undefined),
+          computePlayerFunFacts(id, {
+            includeHidden: includeHiddenInFunFacts,
+            reportHiddenPassCount: isOwnProfile,
+          }),
+          Player.findByPk(id, {
+            attributes: [
+              'placementCardLayout',
+              'placementDisplayMode',
+              'hiddenPlacementIds',
+              'placementOrderIds',
+              'showFollowerCount',
+            ],
+          }),
+          assemblePresentationForPlayer(id),
+          followFieldsForProfile('player', id, user?.id),
+          getPeakRankedScoreRank({ playerId: id }),
+          getProfileModulesApiPayload('player', id),
+        ]);
+
+      const placementService = PlacementUtilizationService.getInstance();
+      const [tournamentPlacements, equippedAvatarFrame, placementEntitlements, placementDisplayNodes] =
+        await Promise.all([
+          placementService.getPlacementsForPlayer(id, {
+            includeProfileHidden: isOwnProfile,
+          }),
+          placementService.getEquippedCosmetic({playerId: id}, 'avatar_frame'),
+          isOwnProfile
+            ? placementService.listEntitlements({playerId: id})
+            : Promise.resolve([]),
+          isOwnProfile
+            ? placementService.getDisplayTree({playerId: id})
+            : Promise.resolve([]),
+        ]);
+
+
+      // `passes` is intentionally not forwarded here — the list is huge
+      // (level/credits/judgements/difficulty all joined in) and is now
+      // fetched lazily by the client via GET /v3/players/:id/passes.
+      const plainEnriched = enriched
+        ? {
+            topScores: enriched.topScores?.map((s: any) => (s?.get ? s.get({ plain: true }) : s)),
+            potentialTopScores: enriched.potentialTopScores?.map((s: any) =>
+              s?.get ? s.get({ plain: true }) : s,
+            ),
+          }
+        : { topScores: [], potentialTopScores: [] };
+
+      const stellarOn = isTufStellarFeatureEnabled();
+      const presentationPatch = {
+        bio: presentation.bio,
+        bioCanvas: presentation.bioCanvas,
+        bioCanvasImageAssets: presentation.bioCanvasImageAssets,
+        bannerPreset: presentation.bannerPreset,
+        customBannerId: presentation.customBannerId,
+        customBannerUrl: presentation.customBannerUrl,
+        profileHeaderSurfaceStyle: presentation.profileHeaderSurfaceStyle,
+        profileHeaderSurfaceImageAssets: presentation.profileHeaderSurfaceImageAssets,
+        tufStellarIconVariant: stellarOn
+          ? normalizeTufStellarIconVariant(presentation.tufStellarIconVariant)
+          : '1',
+        ...(playerRow
+          ? {
+              placementDisplayMode:
+                playerRow.placementDisplayMode === 'customLayers'
+                  ? 'customLayers'
+                  : 'defaultHierarchy',
+              ...(isOwnProfile
+                ? {
+                    hiddenPlacementIds: Array.isArray(playerRow.hiddenPlacementIds)
+                      ? playerRow.hiddenPlacementIds
+                      : [],
+                    placementOrderIds: Array.isArray(playerRow.placementOrderIds)
+                      ? playerRow.placementOrderIds
+                      : [],
+                  }
+                : {}),
+              placementCardLayout:
+                playerRow.placementCardLayout === 'iconRail' ? 'iconRail' : 'default',
+            }
+          : {}),
+        ...(isOwnProfile && user?.id
+          ? { presentationSync: await getPresentationSyncForUser(user.id) }
+          : {}),
+      };
+
+      let aliases = Array.isArray((doc as {aliases?: unknown}).aliases)
+        ? (doc as {aliases: Array<{id?: number; name: string}>}).aliases
+        : [];
+      if (aliases.length === 0) {
+        const rows = await PlayerAlias.findAll({
+          where: {playerId: id},
+          attributes: ['id', 'name'],
+          order: [['id', 'ASC']],
+        });
+        aliases = rows.map((a) => ({id: a.id, name: a.name}));
+      }
+
+      const profileUserId =
+        typeof (doc as {user?: {id?: unknown}}).user?.id === 'string'
+          ? (doc as {user: {id: string}}).user.id
+          : null;
+      const youtubeChannels =
+        isYoutubeChannelLinkingEnabled() && profileUserId
+          ? await youtubeChannelService.listPublic(profileUserId)
+          : [];
+
+      return res.json({
+        ...doc,
+        ...presentationPatch,
+        ...ranks,
+        ...plainEnriched,
+        funFacts,
+        highestRankedScore,
+        aliases,
+        tournamentPlacements,
+        equippedAvatarFrame,
+        isFollowing: follow.isFollowing,
+        followerCount: follow.followerCount,
+        showFollowerCount: coerceShowFollowerCount(playerRow?.showFollowerCount),
+        youtubeChannels,
+        ...profileModulesPayload,
+        ...(isOwnProfile ? {placementEntitlements, placementDisplayNodes} : {}),
+      });
+
+    } catch (error) {
+      logger.error('[v3 /players/:id/profile] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch player profile',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.get(
+  '/:id([0-9]{1,20})/followers',
+  Auth.addUserToRequest(),
+  profileFollowLimiter.middleware,
+  ApiDoc({
+    operationId: 'v3GetPlayerFollowers',
+    summary: 'List public followers of a player',
+    description:
+      'Paginated public follower list (newest first). Hidden follows are counted only, never named. If the owner hides the follower count, non-owners get an empty list.',
+    tags: ['Database', 'Players', 'v3'],
+    params: {id: idParamSpec},
+    query: {
+      page: {schema: {type: 'string'}},
+      limit: {schema: {type: 'string'}},
+    },
+    responses: {
+      200: {
+        description: 'Follower page',
+        schema: {
+          type: 'object',
+          properties: {
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  userId: {type: 'string'},
+                  username: {type: 'string'},
+                  nickname: {type: 'string', nullable: true},
+                  avatarUrl: {type: 'string', nullable: true},
+                  playerId: {type: 'integer', nullable: true},
+                  creatorId: {type: 'integer', nullable: true},
+                },
+              },
+            },
+            page: {type: 'integer'},
+            limit: {type: 'integer'},
+            visibleCount: {type: 'integer'},
+            hiddenCount: {type: 'integer'},
+          },
+        },
+      },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => handleFollowersGet(req, res, 'player'),
+);
+
+router.put(
+  '/:id([0-9]{1,20})/follow',
+  Auth.user(),
+  profileFollowLimiter.middleware,
+  ApiDoc({
+    operationId: 'v3PutPlayerFollow',
+    summary: 'Follow or unfollow a player',
+    description: 'Set follow state for the authenticated user. Body: following (boolean). Cannot follow your own player profile.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    params: {id: idParamSpec},
+    requestBody: {
+      description: 'following: boolean',
+      schema: {
+        type: 'object',
+        properties: {following: {type: 'boolean'}},
+        required: ['following'],
+      },
+      required: true,
+    },
+    responses: {
+      200: {
+        description: 'Follow state',
+        schema: {
+          type: 'object',
+          properties: {
+            following: {type: 'boolean'},
+            followerCount: {type: 'integer'},
+          },
+        },
+      },
+      400: {schema: errorResponseSchema},
+      ...standardErrorResponses401404500,
+    },
+  }),
+  async (req: Request, res: Response) => handleFollowPut(req, res, 'player'),
+);
+
+router.patch(
+  '/me/bio',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'v3PatchPlayerMeBio',
+    summary: 'Update my player bio (v3)',
+    description:
+      'Requires an authenticated user with `playerId` set. Updates that player row only.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    requestBody: {
+      description: 'Bio text (string or null). Empty string clears.',
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          bio: { type: 'string', nullable: true },
+        },
+        required: ['bio'],
+      },
+    },
+    responses: {
+      200: { description: 'Updated bio' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!user.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const body = req.body as { bio?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'bio')) {
+        return res.status(400).json({ error: 'Request body must include bio (string or null)' });
+      }
+
+      let nextBio: string | null;
+      if (body.bio == null) {
+        nextBio = null;
+      } else if (typeof body.bio === 'string') {
+        const trimmed = body.bio.trim();
+        if (trimmed.length > 2000) {
+          return res.status(400).json({ error: 'Bio must be at most 2000 characters' });
+        }
+        nextBio = trimmed.length ? trimmed : null;
+      } else {
+        return res.status(400).json({ error: 'Bio must be a string or null' });
+      }
+
+      const result = await patchPlainBioForEntity('player', user.playerId, nextBio);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      logger.error('[v3 PATCH /players/me/bio] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update player bio',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.patch(
+  '/me/profile-modules',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'v3PatchPlayerMeProfileModules',
+    summary: 'Update my player profile module layout (v3)',
+    description:
+      'Requires an authenticated user with `playerId` set. Saves the ordered module list. Slot cap is 5, or 12 with TUFStellar.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    requestBody: {
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          version: {type: 'integer'},
+          modules: {type: 'array'},
+        },
+        required: ['modules'],
+      },
+    },
+    responses: {
+      200: {description: 'Updated profile modules'},
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({error: 'Unauthorized'});
+      if (!user.playerId) {
+        return res.status(400).json({error: 'No player profile linked to this account'});
+      }
+
+      const result = await saveProfileModulesForEntity({
+        entityKind: 'player',
+        entityId: user.playerId,
+        userId: user.id,
+        raw: req.body,
+      });
+      await CacheInvalidation.invalidateUser(user.id);
+      return res.json(result);
+    } catch (error) {
+      if (error instanceof ProfileCustomizationError) {
+        return res.status(error.status).json({error: error.message});
+      }
+      logger.error('[v3 PATCH /players/me/profile-modules] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update profile modules',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.patch(
+  '/me/show-follower-count',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'v3PatchPlayerMeShowFollowerCount',
+    summary: 'Toggle public follower count on my player profile',
+    description:
+      'Requires an authenticated user with `playerId` set. Body: `{ showFollowerCount: boolean }`. On by default.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    requestBody: {
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {showFollowerCount: {type: 'boolean'}},
+        required: ['showFollowerCount'],
+      },
+    },
+    responses: {
+      200: {
+        description: 'Updated display flag',
+        schema: {
+          type: 'object',
+          properties: {showFollowerCount: {type: 'boolean'}},
+        },
+      },
+      400: {schema: errorResponseSchema},
+      ...standardErrorResponses401404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({error: 'Unauthorized'});
+      if (!user.playerId) {
+        return res.status(400).json({error: 'No player profile linked to this account'});
+      }
+
+      const body = req.body as {showFollowerCount?: unknown};
+      if (typeof body.showFollowerCount !== 'boolean') {
+        return res.status(400).json({error: 'showFollowerCount must be a boolean'});
+      }
+
+      const player = await Player.findByPk(user.playerId, {attributes: ['id', 'showFollowerCount']});
+      if (!player) {
+        return res.status(404).json({error: 'Player not found'});
+      }
+
+      player.showFollowerCount = body.showFollowerCount;
+      await player.save();
+
+      await CacheInvalidation.invalidateUser(user.id);
+      return res.json({showFollowerCount: coerceShowFollowerCount(player.showFollowerCount)});
+    } catch (error) {
+      logger.error('[v3 PATCH /players/me/show-follower-count] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update follower count display',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.patch(
+  '/me/bio-canvas',
+  Auth.tufStellarUser(),
+  ApiDoc({
+    operationId: 'v3PatchPlayerMeBioCanvas',
+    summary: 'Update my player bio canvas (v3)',
+    description:
+      'Requires TUFStellar access. Saves block document and derives plaintext bio for search.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    requestBody: {
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          canvas: { type: 'object', nullable: true },
+        },
+        required: ['canvas'],
+      },
+    },
+    responses: {
+      200: { description: 'Updated bio canvas' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!isTufStellarFeatureEnabled()) {
+        return res.status(403).json({ error: 'TUFStellar is not available on this deployment' });
+      }
+      if (!user.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const body = req.body as { canvas?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'canvas')) {
+        return res.status(400).json({ error: 'Request body must include canvas (object or null)' });
+      }
+
+      const result = await patchBioCanvasForProfile(Player, user.playerId, body.canvas);
+
+      await elasticsearchService.reindexPlayers([user.playerId]);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      if (error instanceof BioCanvasProfileError) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      logger.error('[v3 PATCH /players/me/bio-canvas] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update bio canvas',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.post(
+  '/me/bio-canvas/image',
+  Auth.tufStellarUser(),
+  upload.single('image'),
+  ApiDoc({
+    operationId: 'v3PostPlayerMeBioCanvasImage',
+    summary: 'Upload bio canvas image block asset',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    responses: {
+      200: { description: 'Uploaded' },
+      400: { description: 'No file or invalid blockId', schema: errorResponseSchema },
+      401: { description: 'Unauthorized', schema: errorResponseSchema },
+      403: { description: 'Forbidden', schema: errorResponseSchema },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!isTufStellarFeatureEnabled()) {
+        return res.status(403).json({ error: 'TUFStellar is not available on this deployment' });
+      }
+      if (!user.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded', code: 'NO_FILE' });
+      }
+
+      const blockId = parseBioCanvasBlockId(req);
+      if (!blockId) {
+        return res.status(400).json({ error: 'blockId is required' });
+      }
+
+      const uploadResult = await uploadBioCanvasImageForProfile(
+        Player,
+        user.playerId,
+        blockId,
+        req.file,
+      );
+
+      await elasticsearchService.reindexPlayers([user.playerId]);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(uploadResult);
+    } catch (error) {
+      if (error instanceof BioCanvasProfileError) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      if (error instanceof CdnError) {
+        return respondWithCdnError(res, error);
+      }
+      logger.error('[v3 POST /players/me/bio-canvas/image] failure', error);
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to upload bio canvas image',
+      });
+    }
+  },
+);
+
+router.patch(
+  '/me/tuf-stellar-icon-variant',
+  Auth.tufStellarUser(),
+  ApiDoc({
+    operationId: 'v3PatchPlayerMeTufStellarIconVariant',
+    summary: 'Update my player TUFStellar icon variant (v3)',
+    description:
+      'Requires an authenticated user with `playerId` set and active TUFStellar access. Body: `{ variant: "1" | "2" | "3" }`.',
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    requestBody: {
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          variant: { type: 'string', enum: ['1', '2', '3'] },
+        },
+        required: ['variant'],
+      },
+    },
+    responses: {
+      200: { description: 'Updated variant' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!isTufStellarFeatureEnabled()) {
+        return res.status(403).json({ error: 'TUFStellar is not available on this deployment' });
+      }
+      if (!user.playerId) {
+        return res.status(400).json({ error: 'No player profile linked to this account' });
+      }
+
+      const body = req.body as { variant?: unknown };
+      if (!Object.prototype.hasOwnProperty.call(body, 'variant')) {
+        return res.status(400).json({ error: 'Request body must include variant' });
+      }
+      const rawVariant = body.variant;
+      if (typeof rawVariant !== 'string' || !['1', '2', '3'].includes(rawVariant.trim())) {
+        return res.status(400).json({ error: 'variant must be "1", "2", or "3"' });
+      }
+      const next = normalizeTufStellarIconVariant(rawVariant);
+
+      const result = await setStellarIconVariantForEntity('player', user.playerId, next);
+      await CacheInvalidation.invalidateUser(user.id);
+
+      return res.json(result);
+    } catch (error) {
+      logger.error('[v3 PATCH /players/me/tuf-stellar-icon-variant] failure', error);
+      return res.status(500).json({
+        error: 'Failed to update TUFStellar icon variant',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Paginated passes list for a player. Split out from `/profile` because the
+ * payload is large — levels, credits, judgements, and difficulty are all
+ * joined in — and clients want to render the profile header and fun facts
+ * immediately while passes stream in via infinite scroll.
+ *
+ * Server-side sort/search lets the client page through thousands of passes
+ * without ever loading the whole dataset. Hidden passes are revealed only to
+ * the owning caller, and only when they explicitly opt in via `showHidden`.
+ *
+ * Query: limit (<=100), offset, sortBy (score|speed|date|xacc|difficulty),
+ *        order (ASC|DESC), query (free text), showHidden (true|false),
+ *        bestPerLevel (true|false) — only the highest scoreV2 pass per level.
+ *        sortBy `impact` matches ranked-score contribution weights used for
+ *        profile topScores / potentialTopScores (best pass per level, then
+ *        score * 0.9^(rank-1) within the top 20 of each list).
+ */
+const PASSES_SORT_BY_VALUES = ['score', 'speed', 'date', 'xacc', 'difficulty', 'impact'] as const;
+type PassesSortBy = (typeof PASSES_SORT_BY_VALUES)[number];
+
+router.get(
+  '/:id([0-9]{1,20})/passes',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'v3GetPlayerPasses',
+    summary: 'Get player passes (v3)',
+    description:
+      "Paginated list of a player's passes (trimmed to just what the profile UI needs). Hidden passes are included only when the caller owns the profile and passes `showHidden=true`.",
+    tags: ['Database', 'Players', 'v3'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    query: {
+      limit: { schema: { type: 'string' } },
+      offset: { schema: { type: 'string' } },
+      sortBy: { schema: { type: 'string', enum: PASSES_SORT_BY_VALUES as unknown as string[] } },
+      order: { schema: { type: 'string', enum: ['ASC', 'DESC'] } },
+      query: { schema: { type: 'string' } },
+      showHidden: { schema: { type: 'string' } },
+      bestPerLevel: { schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Player passes (paginated)' },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid player id' });
+      }
+
+      const player = await elasticsearchService.getPlayerDocumentById(id);
+      if (!player) return res.status(404).json({ error: 'Player not found' });
+
+      const user = req.user;
+
+      const limit = parseLimit(req.query.limit, 50);
+      const offset = parseOffset(req.query.offset);
+      const rawSort = typeof req.query.sortBy === 'string' ? req.query.sortBy : '';
+      const sortBy: PassesSortBy = (PASSES_SORT_BY_VALUES as readonly string[]).includes(rawSort)
+        ? (rawSort as PassesSortBy)
+        : 'score';
+      const order = String(req.query.order || '').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+      const query = typeof req.query.query === 'string' ? req.query.query : '';
+      const showHidden = String(req.query.showHidden || '').toLowerCase() === 'true';
+      const bestPerLevel = String(req.query.bestPerLevel || '').toLowerCase() === 'true';
+
+      const { total, passes } = await playerStatsService.getPlayerPasses(id, user, {
+        limit,
+        offset,
+        sortBy,
+        order,
+        query,
+        showHidden,
+        bestPerLevel,
+      });
+
+      return res.json({ total, passes, limit, offset });
+    } catch (error) {
+      logger.error('[v3 /players/:id/passes] failure', error);
+      return res.status(500).json({
+        error: 'Failed to fetch player passes',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+router.patch(
+  '/me/placement-display',
+  Auth.user(),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({error: 'No player profile linked to this account'});
+      }
+      const prefs =
+        await PlacementUtilizationService.getInstance().setPlacementDisplayPrefs(
+          {playerId: user.playerId},
+          {
+            cardLayout: req.body.cardLayout,
+            placementDisplayMode: req.body.placementDisplayMode,
+            placementOrderIds: req.body.placementOrderIds,
+            hiddenPlacementIds: req.body.hiddenPlacementIds,
+            placementDisplayNodes: req.body.placementDisplayNodes,
+          },
+        );
+      return res.json(prefs);
+    } catch (error) {
+      logger.error('[v3 PATCH /players/me/placement-display] failure', error);
+      return res.status(500).json({error: 'Failed to update placement display'});
+    }
+  },
+);
+
+router.patch(
+  '/me/equipped-cosmetic',
+  Auth.user(),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({error: 'No player profile linked to this account'});
+      }
+      const rewardType = String(req.body.rewardType || 'avatar_frame');
+      const entitlementId =
+        req.body.entitlementId == null ? null : Number(req.body.entitlementId);
+      if (entitlementId != null && !Number.isFinite(entitlementId)) {
+        return res.status(400).json({error: 'Invalid entitlementId'});
+      }
+      const equipped = await PlacementUtilizationService.getInstance().equipCosmetic(
+        {playerId: user.playerId},
+        rewardType,
+        entitlementId,
+      );
+      return res.json(equipped);
+    } catch (error: any) {
+      if (error?.code === 404) return res.status(404).json({error: error.message});
+      if (error?.code === 403) return res.status(403).json({error: error.message});
+      if (error?.code === 400) return res.status(400).json({error: error.message});
+      logger.error('[v3 PATCH /players/me/equipped-cosmetic] failure', error);
+      return res.status(500).json({error: 'Failed to equip cosmetic'});
+    }
+  },
+);
+
+router.get(
+  '/me/placement-entitlements',
+  Auth.user(),
+  async (req: Request, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user?.playerId) {
+        return res.status(400).json({error: 'No player profile linked to this account'});
+      }
+      const rewardType =
+        typeof req.query.rewardType === 'string' ? req.query.rewardType : undefined;
+      const entitlements = await PlacementUtilizationService.getInstance().listEntitlements(
+        {playerId: user.playerId},
+        {rewardType},
+      );
+      const equipped = await PlacementUtilizationService.getInstance().getEquippedCosmetic(
+        {playerId: user.playerId},
+        rewardType || 'avatar_frame',
+      );
+      return res.json({entitlements, equipped});
+    } catch (error) {
+      logger.error('[v3 GET /players/me/placement-entitlements] failure', error);
+      return res.status(500).json({error: 'Failed to list entitlements'});
+    }
+  },
+);
+
+export default router;
+

@@ -1,0 +1,854 @@
+import fs from 'fs';
+import path from 'path';
+import CdnFile from '@/models/cdn/CdnFile.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { cdnLocalTemp } from '../infra/workspaces/cdnLocalTempManager.js';
+import { spacesStorage } from '../infra/storage/spacesStorage.js';
+import LevelDict from 'adofai-lib';
+import { levelCacheService } from './levelCacheService.js';
+import { computeLevelCacheMetadataSignature } from '../domain/level/levelCacheSignature.js';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+import { Transaction } from 'sequelize';
+import {
+    MAX_LEVEL_FILE_SIZE_FOR_PARSE,
+    MAX_LEVEL_TILECOUNT_FOR_FULL_PARSE
+} from '../domain/level/levelParseLimits.js';
+import { scanOversizedLevelFile, type OversizedLevelBasics } from '../domain/level/oversizedHandling/oversizedLevelScan.js';
+import { resolveAudioRelativePath } from '../domain/level/oversizedHandling/oversizedSongPick.js';
+import { readAudioDurationMs } from '../domain/level/oversizedHandling/audioDuration.js';
+import {
+    extractLevelPackPayload as archiveExtractLevelPackPayload,
+    createZipFromFiles as archiveCreateZipFromFiles,
+    detectArchiveFormat,
+    getArchiveExtension,
+    getArchiveMimeType,
+    type ArchiveEntry as ServiceArchiveEntry
+} from '../infra/archive/archiveService.js';
+import {
+    rewriteZipFilenamesToUtf8,
+    zipArchiveFilenamesAlreadyUtf8Clean
+} from '../infra/archive/zipUtf8FilenameRewrite.js';
+import { withWorkspace } from '@/server/services/core/WorkspaceService.js';
+import { normalizeRelativePath, snapshotLevelSourceBytes, toSourceRelativePath } from '../domain/archive/ingestPaths.js';
+import { assertArchiveDecompressionSafe } from '../domain/archive/archiveBombGuard.js';
+import { CDN_CONFIG } from '../config.js';
+import { listArchiveEntriesForIngest } from '../domain/archive/ingestArchiveEntries.js';
+import { LEVEL_SUPPORTED_AUDIO_EXTENSION_SET } from '../constants/levelPackAudio.js';
+import { normaliseOriginalName } from '@/server/services/upload/UploadSessionService.js';
+
+const cdnSequelize = getSequelizeForModelGroup('cdn');
+import { safeTransactionRollback } from '@/misc/utils/Utility.js';
+import { CdnIngestUserError } from '@/externalServices/cdnService/jobs/cdnIngestErrors.js';
+import { classifyZipIngestError } from '@/externalServices/cdnService/jobs/zipIngestErrorClassification.js';
+
+export {CdnIngestUserError};
+
+/** Set on the thrown error after a `failed` job-progress update was emitted (avoids duplicate posts in the route). */
+export function markZipIngestFailureProgressSent(err: unknown): void {
+    if (err instanceof Error) {
+        (err as Error & {cdnZipIngestProgressSent?: boolean}).cdnZipIngestProgressSent = true;
+    }
+}
+
+export function zipIngestFailureProgressWasSent(err: unknown): boolean {
+    return err instanceof Error && Boolean((err as Error & {cdnZipIngestProgressSent?: boolean}).cdnZipIngestProgressSent);
+}
+
+type ZipEntry = ServiceArchiveEntry;
+
+async function extractArchiveEntries(archiveFilePath: string, signal?: AbortSignal): Promise<ZipEntry[]> {
+    return listArchiveEntriesForIngest(archiveFilePath, signal);
+}
+
+type ProgressCallback = (
+    status: 'uploading' | 'processing' | 'caching' | 'failed',
+    progressPercent: number,
+    currentStep?: string,
+    /** When `status === 'failed'`, user-visible text for the main API job `error` field (CDN progress ingest). */
+    failureUserMessage?: string
+) => void | Promise<void>;
+
+export async function processArchiveFile(
+    archiveFilePath: string,
+    archiveFileId: string,
+    originalFilename: string,
+    onProgress?: ProgressCallback
+): Promise<void> {
+    // All on-disk staging for this ingest lives inside a workspace under
+    // WORKSPACE_ROOT/zip-processor/<archiveFileId>/. The workspace's `finally`
+    // removes the dir on success, throw, or shutdown abort, and any orphans
+    // left by SIGKILL get cleaned up by `sweepWorkspaceRootOnBoot()` next start.
+    return withWorkspace(
+        'zip-processor',
+        (ws) => processArchiveFileInWorkspace(ws, archiveFilePath, archiveFileId, originalFilename, onProgress),
+        {
+            key: archiveFileId,
+            parentSignal: AbortSignal.timeout(CDN_CONFIG.zipIngestMaxWallMs),
+        },
+    );
+}
+
+async function processArchiveFileInWorkspace(
+    ws: { dir: string; signal: AbortSignal },
+    archiveFilePath: string,
+    archiveFileId: string,
+    originalFilename: string,
+    onProgress?: ProgressCallback
+): Promise<void> {
+    let transaction: Transaction | undefined;
+    /** Workspace dir; auto-removed by {@link withWorkspace} on success/throw/abort. */
+    const permanentDir = ws.dir;
+    // Preloaded LevelDict for the eventual cache target.
+    // When available, we can populate cache without re-downloading the target from Spaces.
+    let selectedPreloadedTargetLevelData: LevelDict | null = null;
+    let preloadedNonBackupLevelData: LevelDict | null = null;
+    let preloadedBackupLevelData: LevelDict | null = null;
+    let bestNonBackupSize = -1;
+    let bestBackupSize = -1;
+
+    // Detect format up-front so we know which extension to preserve in storage and metadata.
+    const detectedFormat = detectArchiveFormat(originalFilename) || detectArchiveFormat(archiveFilePath) || 'zip';
+    const archiveContentType = getArchiveMimeType(detectedFormat);
+
+    logger.debug('Starting archive file processing:', {
+        archiveFilePath,
+        archiveFileId,
+        originalFilename,
+        detectedFormat,
+        permanentDir,
+        fileSize: (await fs.promises.stat(archiveFilePath)).size
+    });
+
+    /**
+     * Path used for listing / extraction / the on-disk original copy. For `.zip`, when entries
+     * use legacy code-page names without UTF-8 EFS, we rebuild a temp zip that stores the same
+     * paths as UTF-8 + GPF bit 11 and stream-copies deflate/store payloads — so the object users
+     * download never depends on `-mcp` heuristics in their local unzipper.
+     */
+    let ingestArchivePath = archiveFilePath;
+    if (detectedFormat === 'zip') {
+        const alreadyUtf8Clean = await zipArchiveFilenamesAlreadyUtf8Clean(archiveFilePath);
+        if (!alreadyUtf8Clean) {
+            const normalizedZipPath = path.join(permanentDir, '.ingest-utf8-filenames.zip');
+            const rw = await rewriteZipFilenamesToUtf8(archiveFilePath, normalizedZipPath, ws.signal);
+            if (rw.ok) {
+                ingestArchivePath = normalizedZipPath;
+                logger.info('zipProcessor: stored archive normalized to UTF-8 entry names', {
+                    archiveFileId,
+                    entriesWritten: rw.entriesWritten,
+                    detectionReason: rw.detectionReason,
+                    codePage: rw.codePage
+                });
+            } else {
+                logger.warn('zipProcessor: UTF-8 name normalization skipped (using original bytes)', {
+                    archiveFileId,
+                    reason: rw.reason,
+                    detail: rw.detail
+                });
+            }
+        }
+    }
+
+    const sendProgress = async (
+        status: 'uploading' | 'processing' | 'caching' | 'failed',
+        progressPercent: number,
+        currentStep?: string,
+        failureUserMessage?: string
+    ) => {
+        if (onProgress) {
+            await onProgress(status, progressPercent, currentStep, failureUserMessage);
+        }
+    };
+
+    try {
+        await sendProgress('processing', 10, 'Listing archive entries');
+        const archiveEntries = await extractArchiveEntries(ingestArchivePath, ws.signal);
+        const archiveOnDiskSize = (await fs.promises.stat(ingestArchivePath)).size;
+        assertArchiveDecompressionSafe(archiveEntries, archiveOnDiskSize);
+        const levelFiles: { [key: string]: any } = {};
+        const allLevelFiles: Array<{
+            name: string;
+            relativePath: string;
+            path: string;
+            sourceLocalPath?: string;
+            sourceRelativePath?: string;
+            sourcePath?: string;
+            sourceStorageType?: string;
+            size: number;
+            hasYouTubeStream?: boolean;
+            songFilename?: string;
+            oversizedUnparsed?: boolean;
+            oversizedBasics?: OversizedLevelBasics;
+        }> = [];
+        const songFiles: { [key: string]: any } = {};
+
+        logger.debug('Processing archive file in workspace:', {
+            permanentDir,
+            fileId: archiveFileId,
+            format: detectedFormat,
+            totalEntries: archiveEntries.length,
+            totalSize: archiveEntries.reduce((sum, entry) => sum + entry.size, 0)
+        });
+
+        // Chunked uploads normalise in UploadSessionService; URL/Workshop imports use
+        // encodeLevelZipFilenameForCdn on the main API. Re-apply here so object keys never
+        // contain CR/LF (breaks Spaces lookups vs metadata).
+        const finalArchiveName = normaliseOriginalName(originalFilename.normalize('NFC'));
+        logger.debug('Using original archive name:', {
+            finalArchiveName,
+            format: detectedFormat
+        });
+
+        // Store the original archive file with its original name
+        const originalArchiveDiskPath = path.join(permanentDir, finalArchiveName);
+        await fs.promises.copyFile(ingestArchivePath, originalArchiveDiskPath);
+        const originalArchiveSize = (await fs.promises.stat(originalArchiveDiskPath)).size;
+        logger.debug('Stored original archive file:', {
+            originalArchiveDiskPath,
+            finalArchiveName,
+            size: originalArchiveSize,
+            permanentDir
+        });
+
+        // Bulk-extract `.adofai` + audio (see archiveService.extractLevelPackPayload); fall back to full extract
+        // if filtered extraction fails (e.g. solid RAR5) or any listed `.adofai` path is missing (partial extract).
+        const extractRoot = path.join(permanentDir, '.extracted');
+        const levelEntries = archiveEntries.filter(entry => !entry.isDirectory && entry.relativePath.toLowerCase().endsWith('.adofai'));
+        const requiredLevelPaths = levelEntries.map(entry => normalizeRelativePath(entry.relativePath));
+        await sendProgress('processing', 13, 'Extracting level and song files from archive');
+        await archiveExtractLevelPackPayload(ingestArchivePath, extractRoot, ws.signal, {
+            requiredRelativePaths: requiredLevelPaths
+        });
+
+        // First pass: collect all level files (metadata paths come from listing; bytes from `extractRoot`)
+        await sendProgress('processing', 15, 'Processing level files');
+        let totalLevelSize = 0;
+        let processedLevels = 0;
+        for (const entry of levelEntries) {
+            const normalizedRelativePath = normalizeRelativePath(entry.relativePath);
+            const tempPath = path.join(extractRoot, normalizedRelativePath);
+
+            if (!fs.existsSync(tempPath)) {
+                logger.warn('Level file missing after archive extraction; skipping (encoding or partial extract)', {
+                    normalizedRelativePath,
+                    tempPath,
+                    archiveFileId
+                });
+                continue;
+            }
+
+            try {
+                const levelFilename = path.basename(entry.relativePath);
+                const { sourceLocalPath, sourceRelativePath } = await snapshotLevelSourceBytes(
+                    tempPath,
+                    extractRoot,
+                    normalizedRelativePath
+                );
+                const tooLargeToParse = entry.size > MAX_LEVEL_FILE_SIZE_FOR_PARSE;
+
+                let levelFile: {
+                    name: string;
+                    relativePath: string;
+                    path: string;
+                    sourceLocalPath: string;
+                    sourceRelativePath: string;
+                    sourcePath?: string;
+                    sourceStorageType?: string;
+                    size: number;
+                    hasYouTubeStream?: boolean;
+                    songFilename?: string;
+                    oversizedUnparsed?: boolean;
+                    oversizedBasics?: OversizedLevelBasics;
+                    artist?: unknown;
+                    song?: unknown;
+                    author?: unknown;
+                    difficulty?: unknown;
+                    bpm?: unknown;
+                };
+
+                // Stream-scan first: compact charts can be under the byte cap but have massive `angleData`
+                // (unsafe for adofai-lib). When scan fails on a small file we still attempt LevelDict below.
+                let scanned: OversizedLevelBasics | null = null;
+                try {
+                    scanned = await scanOversizedLevelFile(tempPath);
+                } catch (e) {
+                    logger.debug('Stream level scanner failed (non-fatal)', {
+                        name: levelFilename,
+                        error: e instanceof Error ? e.message : String(e)
+                    });
+                }
+
+                const tilecountOverLimit =
+                    scanned !== null && scanned.tilecount > MAX_LEVEL_TILECOUNT_FOR_FULL_PARSE;
+                const skipLevelDict = tooLargeToParse || tilecountOverLimit;
+
+                if (skipLevelDict) {
+                    logger.debug('Skipping LevelDict parse for level file (streaming path)', {
+                        name: levelFilename,
+                        size: entry.size,
+                        maxParseSize: MAX_LEVEL_FILE_SIZE_FOR_PARSE,
+                        tooLargeToParse,
+                        tilecount: scanned?.tilecount,
+                        maxTilesForFullParse: MAX_LEVEL_TILECOUNT_FOR_FULL_PARSE,
+                        tilecountOverLimit
+                    });
+
+                    levelFile = {
+                        name: levelFilename,
+                        relativePath: normalizedRelativePath,
+                        path: tempPath,
+                        sourceLocalPath,
+                        sourceRelativePath,
+                        size: entry.size,
+                        hasYouTubeStream: false,
+                        songFilename: scanned?.settings?.songFilename as any,
+                        bpm: scanned?.settings?.bpm as any,
+                        oversizedUnparsed: true,
+                        ...(scanned ? { oversizedBasics: scanned } : {})
+                    };
+                } else {
+                    const levelDict = new LevelDict(tempPath);
+                    const isBackup = levelFilename.toLowerCase() === 'backup.adofai';
+                    if (isBackup) {
+                        if (entry.size > bestBackupSize) {
+                            bestBackupSize = entry.size;
+                            preloadedBackupLevelData = levelDict;
+                        }
+                    } else {
+                        if (entry.size > bestNonBackupSize) {
+                            bestNonBackupSize = entry.size;
+                            preloadedNonBackupLevelData = levelDict;
+                        }
+                    }
+                    levelFile = {
+                        name: levelFilename,
+                        relativePath: normalizedRelativePath,
+                        path: tempPath, // Working copy; may be rewritten when canonical JSON is normalized
+                        sourceLocalPath,
+                        sourceRelativePath,
+                        size: entry.size,
+                        hasYouTubeStream: levelDict.getSetting('requiredMods')?.includes('YouTubeStream'),
+                        songFilename: levelDict.getSetting('songFilename'),
+                        artist: levelDict.getSetting('artist'),
+                        song: levelDict.getSetting('song'),
+                        author: levelDict.getSetting('author'),
+                        difficulty: levelDict.getSetting('difficulty'),
+                        bpm: levelDict.getSetting('bpm')
+                    };
+                }
+
+                levelFiles[entry.relativePath] = levelFile;
+                allLevelFiles.push(levelFile);
+                totalLevelSize += entry.size;
+                processedLevels++;
+
+                // Update progress: 15-40% for level processing
+                if (levelEntries.length > 0) {
+                    const levelProgress = 15 + Math.round((processedLevels / levelEntries.length) * 25);
+                    await sendProgress('processing', levelProgress, `Processing level files (${processedLevels}/${levelEntries.length})`);
+                }
+
+                logger.debug('Processed level file:', {
+                    name: levelFilename,
+                    size: entry.size,
+                    path: tempPath,
+                    hasYouTubeStream: levelFile.hasYouTubeStream,
+                    skippedLevelDict: skipLevelDict
+                });
+            } catch (error) {
+                logger.debug('Skipped level file during archive scan (parse/validation):', {
+                    entry: entry.relativePath,
+                    error: error instanceof Error ? error.message : String(error)
+                });
+                await fs.promises.unlink(tempPath).catch(() => undefined); // Clean up temp file
+            }
+        }
+
+        if (allLevelFiles.length === 0) {
+            throw new CdnIngestUserError(
+                'No usable .adofai files found after extraction (all missing or failed to parse). ' +
+                    'The archive may be corrupt, use unsupported paths, or contain no valid levels.'
+            );
+        }
+
+        // Second pass: collect all song files
+        await sendProgress('processing', 40, 'Processing song files');
+        let totalSongSize = 0;
+        const songEntries = archiveEntries.filter(
+            (entry) =>
+                !entry.isDirectory &&
+                LEVEL_SUPPORTED_AUDIO_EXTENSION_SET.has(path.extname(entry.relativePath).toLowerCase())
+        );
+        let processedSongs = 0;
+        for (const entry of songEntries) {
+            const normalizedSongPath = normalizeRelativePath(entry.relativePath);
+            const songTempPath = path.join(extractRoot, normalizedSongPath);
+
+            if (!fs.existsSync(songTempPath)) {
+                logger.debug('Song file missing after bulk extraction, skipping', {
+                    relativePath: normalizedSongPath,
+                    songTempPath
+                });
+                continue;
+            }
+
+            const songBasename = path.basename(entry.relativePath);
+            if (songFiles[normalizedSongPath]) {
+                logger.debug('Duplicate song relative path in archive (overwriting)', {
+                    relativePath: normalizedSongPath
+                });
+            } else {
+                const sameBasenameKey = Object.keys(songFiles).find(
+                    (k) => path.posix.basename(k.replace(/\\/g, '/')) === songBasename
+                );
+                if (sameBasenameKey) {
+                    logger.debug('Song files share basename but live under different paths (metadata keys by relative path)', {
+                        basename: songBasename,
+                        earlierRelativePath: sameBasenameKey,
+                        relativePath: normalizedSongPath
+                    });
+                }
+            }
+
+            songFiles[normalizedSongPath] = {
+                name: songBasename,
+                relativePath: normalizedSongPath,
+                path: songTempPath, // Keep temp path for now, will be uploaded later
+                size: entry.size,
+                type: path.extname(entry.relativePath).toLowerCase().slice(1)
+            };
+            totalSongSize += entry.size;
+            processedSongs++;
+
+            // Update progress: 40-50% for song processing
+            if (songEntries.length > 0) {
+                const songProgress = 40 + Math.round((processedSongs / songEntries.length) * 10);
+                await sendProgress('processing', songProgress, `Processing song files (${processedSongs}/${songEntries.length})`);
+            }
+        }
+
+        // Upload files to hybrid storage (Spaces or local)
+        logger.debug('Uploading processed files to hybrid storage', {
+            fileId: archiveFileId,
+            levelCount: allLevelFiles.length,
+            songCount: Object.keys(songFiles).length
+        });
+
+        // Upload immutable pre-parse sources first (separate local paths from working extracts).
+        await sendProgress('uploading', 50, 'Uploading level source files');
+        const sourceUploadResults: Array<{ path: string; storageType: string } | null> = [];
+        for (const file of allLevelFiles) {
+            const sourceRelativePath = file.sourceRelativePath || toSourceRelativePath(file.relativePath);
+            const sourceKey = `levels/${archiveFileId}/${sourceRelativePath}`;
+            await spacesStorage.uploadFile(file.sourceLocalPath!, sourceKey, 'application/octet-stream', {
+                fileId: archiveFileId,
+                sourceType: 'original-level-source',
+                originalRelativePath: encodeURIComponent(file.relativePath),
+                uploadedAt: new Date().toISOString()
+            });
+            sourceUploadResults.push({
+                path: sourceKey,
+                storageType: 'spaces'
+            });
+        }
+        await sendProgress('uploading', 58, 'Level source files uploaded');
+
+        // Upload canonical level objects (working extract paths; target may be normalized later).
+        await sendProgress('uploading', 58, 'Uploading level files');
+        const levelUploadResult = await spacesStorage.uploadLevelFiles(
+            allLevelFiles.map(file => ({
+                sourcePath: file.path,
+                filename: file.relativePath,
+                size: file.size
+            })),
+            archiveFileId
+        );
+        await sendProgress('uploading', 65, 'Level files uploaded');
+
+        // Update file paths in metadata
+        allLevelFiles.forEach((file, index) => {
+            const uploadedFile = levelUploadResult.files[index];
+            const uploadedSource = sourceUploadResults[index];
+            file.path = uploadedFile.path;
+            if (uploadedSource) {
+                file.sourcePath = uploadedSource.path;
+                file.sourceStorageType = uploadedSource.storageType;
+            }
+            delete (file as { sourceLocalPath?: string }).sourceLocalPath;
+        });
+
+        // Upload song files preserving archive-relative paths under zips/{fileId}/…
+        await sendProgress('uploading', 65, 'Uploading song files');
+        const songUploadResult = await spacesStorage.uploadSongFiles(
+            Object.entries(songFiles).map(([relativePath, songFile]) => ({
+                sourcePath: songFile.path,
+                filename: relativePath,
+                size: songFile.size,
+                type: songFile.type
+            })),
+            archiveFileId
+        );
+        await sendProgress('uploading', 80, 'Song files uploaded');
+
+        // Persist songFiles keyed by relative path (not basename).
+        const updatedSongFiles: { [key: string]: any } = {};
+        songUploadResult.files.forEach((uploadedFile) => {
+            const relativePath = uploadedFile.filename;
+            updatedSongFiles[relativePath] = {
+                name: path.posix.basename(relativePath),
+                relativePath,
+                path: uploadedFile.path,
+                size: uploadedFile.size,
+                type: uploadedFile.type,
+                url: uploadedFile.url,
+                key: uploadedFile.key
+            };
+        });
+
+        // Upload original archive file (preserve byte-for-byte with original extension/MIME)
+        await sendProgress('uploading', 80, 'Uploading original archive file');
+        const archiveUploadResult = await spacesStorage.uploadArchiveFile(
+            originalArchiveDiskPath,
+            archiveFileId,
+            finalArchiveName,
+            archiveContentType
+        );
+        await sendProgress('uploading', 90, 'Original archive file uploaded');
+
+        // No early disk cleanup needed: the workspace `finally` removes `permanentDir`
+        // when the function returns. Anything still living under it (the original-archive
+        // copy and `.extracted/`) goes with it.
+
+        // Determine target level
+        let targetLevel: string | null = null;
+        let targetLevelRelativePath: string | null = null;
+        let targetLevelOversized = false;
+        /** Reuse stream-scan result from ingest loop to avoid a second full scan for oversized targets. */
+        let oversizedTargetScanBasics: OversizedLevelBasics | undefined;
+        const pathConfirmed = false;
+
+        if (allLevelFiles.length > 0) {
+            // Filter out backup.adofai files first, prefer any other level file
+            const nonBackupFiles = allLevelFiles.filter(file =>
+                file.name.toLowerCase() !== 'backup.adofai'
+            );
+
+            // Select target level: prefer non-backup files, fall back to backup if it's the only option
+            const candidateFiles = nonBackupFiles.length > 0 ? nonBackupFiles : allLevelFiles;
+
+            // Select the largest level file from candidates
+            const largestLevel = candidateFiles.reduce((largest, current) => {
+                return (current.size > largest.size) ? current : largest;
+            });
+
+            targetLevel = largestLevel.path; // Use storage path (Spaces key or local path)
+            targetLevelRelativePath = largestLevel.relativePath;
+            targetLevelOversized = !!largestLevel.oversizedUnparsed;
+            oversizedTargetScanBasics = largestLevel.oversizedBasics;
+            selectedPreloadedTargetLevelData =
+                nonBackupFiles.length > 0 ? preloadedNonBackupLevelData : preloadedBackupLevelData;
+
+            logger.debug('Selected largest level file as target:', {
+                selectedLevel: largestLevel.name,
+                size: largestLevel.size,
+                path: largestLevel.path,
+                totalLevels: allLevelFiles.length,
+                nonBackupCount: nonBackupFiles.length,
+                isBackup: largestLevel.name.toLowerCase() === 'backup.adofai',
+                targetLevelOversized
+            });
+        }
+
+        // Start transaction for database operations
+        await sendProgress('processing', 90, 'Creating database entry');
+        transaction = await cdnSequelize.transaction();
+        for (const lf of allLevelFiles) {
+            delete lf.oversizedBasics;
+        }
+
+        // The same archive object is referenced under both `originalArchive` (new shape with
+        // explicit format/contentType) and `originalZip` (legacy alias for backward compatibility
+        // with readers in routes/levels.ts, routes/zips.ts, services/levelCacheService.ts).
+        const originalArchiveMeta = {
+            name: finalArchiveName,
+            path: archiveUploadResult.filePath,
+            size: originalArchiveSize,
+            originalFilename: finalArchiveName,
+            format: detectedFormat,
+            contentType: archiveContentType,
+            extension: getArchiveExtension(detectedFormat)
+        };
+
+        // Create database entry with comprehensive storage information
+        const cdnFile = await CdnFile.create({
+            id: archiveFileId,
+            type: 'LEVELZIP',
+            filePath: archiveUploadResult.filePath, // Use the actual storage path
+            metadata: {
+                levelFiles,
+                allLevelFiles,
+                songFiles: updatedSongFiles,
+                targetLevel,
+                targetLevelRelativePath,
+                targetLevelOversized,
+                pathConfirmed,
+                // Canonical, format-aware archive descriptor.
+                originalArchive: originalArchiveMeta,
+                // Legacy alias kept for code paths still reading `originalZip`. Same object
+                // reference so both views stay in sync.
+                originalZip: originalArchiveMeta,
+                // Add timestamp for debugging
+                uploadedAt: new Date().toISOString(),
+            }
+        }, { transaction });
+
+        // Commit the transaction
+        await transaction.commit();
+        await sendProgress('processing', 95, 'Database entry created');
+
+        // Oversized target: populate minimal cacheData (tilecount/bpm/song duration) without LevelDict.
+        if (targetLevel && targetLevelOversized) {
+            try {
+                await sendProgress('caching', 96, 'Populating basic cache for oversized level');
+
+                const localTargetPath = targetLevelRelativePath
+                    ? path.join(extractRoot, normalizeRelativePath(targetLevelRelativePath))
+                    : null;
+
+                if (localTargetPath && fs.existsSync(localTargetPath)) {
+                    const basics =
+                        oversizedTargetScanBasics ??
+                        (await scanOversizedLevelFile(localTargetPath));
+
+                    const audioCandidates = Object.keys(songFiles).map((relativePath) => ({
+                        relativePath
+                    }));
+                    const chosenAudioRel = resolveAudioRelativePath({
+                        candidates: audioCandidates,
+                        levelRelativePath: targetLevelRelativePath,
+                        settingsSongFilename: basics.settings.songFilename
+                    });
+
+                    const chosenAudioLocalPath =
+                        chosenAudioRel && songFiles[normalizeRelativePath(chosenAudioRel)]
+                            ? songFiles[normalizeRelativePath(chosenAudioRel)].path
+                            : chosenAudioRel && songFiles[chosenAudioRel]
+                                ? songFiles[chosenAudioRel].path
+                                : null;
+
+                    const levelLengthInMs =
+                        chosenAudioLocalPath ? await readAudioDurationMs(chosenAudioLocalPath) : null;
+
+                    const metaForSignature = cdnFile.metadata as any;
+                    const minimalCache = {
+                        _metadataSignature: computeLevelCacheMetadataSignature(metaForSignature),
+                        tilecount: basics.tilecount,
+                        settings: {
+                            bpm: basics.settings.bpm,
+                            offset: basics.settings.offset,
+                            songFilename: basics.settings.songFilename
+                        },
+                        analysis: levelLengthInMs !== null ? { levelLengthInMs } : {},
+                        transformOptions: { eventTypes: [], filterTypes: [], advancedFilterTypes: [] }
+                    };
+
+                    await cdnFile.update({
+                        cacheData: JSON.stringify(minimalCache)
+                    });
+                } else {
+                    logger.warn('Oversized target local file missing; cannot build basic cache', {
+                        fileId: archiveFileId,
+                        targetLevelRelativePath,
+                        extractRoot
+                    });
+                }
+            } catch (cacheError) {
+                logger.warn('Failed to populate basic cache for oversized target (non-critical):', {
+                    fileId: archiveFileId,
+                    error: cacheError instanceof Error ? cacheError.message : String(cacheError)
+                });
+            }
+        }
+
+        // Populate cache immediately using the extracted/parsed target LevelDict, when available.
+        // This avoids the redundant download/parse roundtrip in a later `refreshCache` call.
+        if (targetLevel && !targetLevelOversized && selectedPreloadedTargetLevelData) {
+            try {
+                await sendProgress('caching', 96, 'Populating cache from extracted level');
+                await levelCacheService.populateCache(
+                    cdnFile,
+                    targetLevel,
+                    undefined,
+                    selectedPreloadedTargetLevelData
+                );
+
+                // Normalize canonical storage via LevelDict.writeToFile (preserves pathData when applicable).
+                const canonicalLocalPath = targetLevelRelativePath
+                    ? path.join(extractRoot, normalizeRelativePath(targetLevelRelativePath))
+                    : path.join(extractRoot, `canonical_target_${Date.now()}.adofai`);
+                await levelCacheService.persistCanonicalLevel(
+                    selectedPreloadedTargetLevelData,
+                    canonicalLocalPath,
+                    targetLevel
+                );
+                await levelCacheService.markTargetSafeToParse(cdnFile, cdnFile.metadata);
+            } catch (cacheError) {
+                logger.warn('Failed to populate cache from extracted level (non-critical):', {
+                    fileId: archiveFileId,
+                    error: cacheError instanceof Error ? cacheError.message : String(cacheError)
+                });
+            }
+        }
+
+        logger.debug('Successfully processed archive file:', {
+            fileId: archiveFileId,
+            format: detectedFormat,
+            permanentDir,
+            levelCount: allLevelFiles.length,
+            songCount: Object.keys(updatedSongFiles).length,
+            totalLevelSize,
+            totalSongSize,
+            originalArchiveSize,
+            totalSize: totalLevelSize + totalSongSize + originalArchiveSize,
+            targetLevel,
+            pathConfirmed,
+            hasOriginalArchive: true
+        });
+    } catch (error) {
+        // Rollback transaction if it exists
+        if (transaction) {
+            try {
+                await safeTransactionRollback(transaction);
+            } catch (rollbackError) {
+                logger.warn('Transaction rollback failed:', rollbackError);
+            }
+        }
+
+        // `permanentDir` (the workspace dir) is removed by `withWorkspace`'s `finally` —
+        // no manual filesystem cleanup needed here regardless of failure mode.
+
+        const errObj = error instanceof Error ? error : null;
+        const anyErr = errObj as (Error & {
+            exitCode?: number;
+            sevenZSummary?: string;
+            sevenZBinary?: string;
+            clientFacing?: boolean;
+            archiveErrorKind?: string;
+            userMessage?: string;
+            skipLogging?: boolean;
+        }) | null;
+
+        const classified = classifyZipIngestError(error);
+        const rawUserMsg = classified.userMessage;
+        const capped =
+            rawUserMsg.length > 1600 ? `${rawUserMsg.slice(0, 1600)}… [truncated]` : rawUserMsg;
+
+        if (classified.serverLog === 'info' && anyErr?.clientFacing) {
+            logger.info('Archive rejected (user error):', {
+                archiveFileId,
+                archiveFilePath,
+                archiveErrorKind: anyErr.archiveErrorKind,
+                userMessage: anyErr.userMessage,
+                ...(typeof anyErr.exitCode === 'number' ? {sevenZExitCode: anyErr.exitCode} : {}),
+            });
+        } else if (classified.serverLog === 'error') {
+            logger.error('Error processing archive file:', {
+                error: errObj?.message ?? String(error),
+                stack: errObj?.stack,
+                ...(typeof anyErr?.exitCode === 'number' ? {sevenZExitCode: anyErr.exitCode} : {}),
+                ...(typeof anyErr?.sevenZBinary === 'string' ? {sevenZBinary: anyErr.sevenZBinary} : {}),
+                ...(typeof anyErr?.sevenZSummary === 'string' ? {sevenZSummary: anyErr.sevenZSummary} : {}),
+                archiveFilePath,
+                archiveFileId,
+                timestamp: new Date().toISOString(),
+            });
+        }
+
+        await sendProgress('failed', 0, capped, capped);
+        markZipIngestFailureProgressSent(error);
+        throw error;
+    }
+}
+
+/**
+ * Backwards-compatible alias. Older callers used `processZipFile`; new code should call
+ * `processArchiveFile`. Both accept any supported archive format (the function detects
+ * the format internally).
+ */
+export const processZipFile = processArchiveFile;
+
+
+interface RepackMetadata {
+    levelFile: {
+        name: string;
+        path: string;
+        size: number;
+    };
+    songFile?: {
+        name: string;
+        path: string;
+        size: number;
+        type: string;
+    };
+}
+
+export async function repackZipFile(metadata: RepackMetadata, outputDir?: string): Promise<string> {
+    let tempZipPath: string | null = null;
+
+    logger.debug('Starting zip file repacking:', { metadata, outputDir });
+
+    try {
+        if (outputDir) {
+            await fs.promises.mkdir(outputDir, { recursive: true });
+            tempZipPath = path.join(
+                outputDir,
+                'repacked_' + Date.now() + '_' + Math.random().toString(36).substring(7) + '.zip'
+            );
+        } else {
+            const storageRoot = cdnLocalTemp.getLocalRoot();
+            tempZipPath = path.join(
+                storageRoot,
+                'temp',
+                'repacked_' + Date.now() + '_' + Math.random().toString(36).substring(7) + '.zip'
+            );
+        }
+        logger.debug('Created temporary zip path:', { tempZipPath });
+
+        const filesToZip: { path: string; nameInArchive: string }[] = [
+            { path: metadata.levelFile.path, nameInArchive: metadata.levelFile.name }
+        ];
+
+        if (metadata.songFile) {
+            filesToZip.push({
+                path: metadata.songFile.path,
+                nameInArchive: metadata.songFile.name
+            });
+        }
+
+        logger.debug('Writing zip via archiveService:', {
+            tempZipPath,
+            files: filesToZip.map(f => f.nameInArchive)
+        });
+        await archiveCreateZipFromFiles(filesToZip, tempZipPath);
+
+        logger.debug('Zip file repacked successfully');
+        return tempZipPath;
+    } catch (error) {
+        logger.error('Error repacking zip file:', {
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+            metadata,
+            tempZipPath,
+            outputDir
+        });
+
+        if (tempZipPath) {
+            logger.debug('Cleaning up temporary zip file due to error:', { tempZipPath });
+            // Only cleanup if it's in the temp folder, not in the repack folder
+            if (!outputDir) {
+                cdnLocalTemp.cleanupFiles(tempZipPath);
+            }
+        }
+        throw new Error('Failed to repack zip file');
+    }
+}

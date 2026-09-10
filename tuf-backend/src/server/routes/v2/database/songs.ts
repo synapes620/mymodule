@@ -1,0 +1,1308 @@
+import {Router, Request, Response} from 'express';
+import {Op} from 'sequelize';
+import {Auth} from '@/server/middleware/auth.js';
+import {ApiDoc} from '@/server/middleware/apiDoc.js';
+import { standardErrorResponses, standardErrorResponses404500, standardErrorResponses500, idParamSpec, errorResponseSchema } from '@/server/schemas/v2/database/index.js';
+import Song from '@/models/songs/Song.js';
+import SongAlias from '@/models/songs/SongAlias.js';
+import SongLink from '@/models/songs/SongLink.js';
+import SongEvidence from '@/models/songs/SongEvidence.js';
+import SongCredit from '@/models/songs/SongCredit.js';
+import Artist from '@/models/artists/Artist.js';
+import Level from '@/models/levels/Level.js';
+import sequelize from '@/config/db.js';
+import {escapeForMySQL} from '@/misc/utils/data/searchHelpers.js';
+import { getSongDisplayName } from '@/misc/utils/data/levelHelpers.js';
+import { annotateLevelsWithLikeState } from '@/misc/utils/data/levelLikeState.js';
+import {logger} from '@/server/services/core/LoggerService.js';
+import {safeTransactionRollback} from '@/misc/utils/Utility.js';
+import SongService from '@/server/services/data/SongService.js';
+import EvidenceService from '@/server/services/data/EvidenceService.js';
+import cdnServiceInstance, { CdnError, respondWithCdnError } from '@/server/services/core/CdnService.js';
+import { multerMemoryCdnImage10Mb as upload } from '@/config/multerMemoryUploads.js';
+import ElasticsearchService from '@/server/services/elasticsearch/ElasticsearchService.js';
+import { parseSearchQuery, queryParserConfigs, extractFieldValues, extractGeneralSearchTerms } from '@/misc/utils/data/queryParser.js';
+import { PaginationQuery } from '@/server/interfaces/models/index.js';
+
+
+const router: Router = Router();
+const songService = SongService.getInstance();
+const evidenceService = EvidenceService.getInstance();
+const elasticsearchService = ElasticsearchService.getInstance();
+
+// Get public song list (paginated, searchable)
+router.get(
+  '/',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getSongs',
+    summary: 'List songs',
+    description: 'Paginated, searchable song list. Query: page, offset, limit, search, artistId, sort, verificationState.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    query: { page: { schema: { type: 'string' } }, offset: { schema: { type: 'string' } }, limit: { schema: { type: 'string' } }, search: { schema: { type: 'string' } }, artistId: { schema: { type: 'string' } }, sort: { schema: { type: 'string' } }, verificationState: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Songs list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const { page, limit, offset } = req.query as unknown as PaginationQuery;
+    const {
+      search = '',
+      artistId,
+      sort = 'NAME_ASC',
+      verificationState,
+    } = req.query;
+
+
+    const originalSearchString = (search as string).trim();
+
+    // Parse search query to extract both general search terms and artist count filters
+    let artistCountFilter: { min?: number; max?: number; exact?: number } | null = null;
+    let searchString = '';
+
+    if (originalSearchString) {
+      const searchGroups = parseSearchQuery(originalSearchString, queryParserConfigs.song);
+      logger.debug(`Search groups: ${JSON.stringify(searchGroups)}`);
+
+      // Extract general search terms (field === 'any')
+      const generalSearchTerms = extractGeneralSearchTerms(searchGroups);
+      // Combine general search terms with spaces for text search
+      searchString = generalSearchTerms.join(' ').trim();
+
+      // Extract artist count filter values
+      const artistCountValues = extractFieldValues(searchGroups, 'artists');
+
+      if (artistCountValues.length > 0) {
+        // Parse artist count value (supports: "2+", "3", "2-5")
+        const artistCountValue = artistCountValues[0];
+
+        // Handle "2+" format (2 or more)
+        if (artistCountValue.endsWith('+')) {
+          const minCount = parseInt(artistCountValue.slice(0, -1));
+          if (!isNaN(minCount) && minCount >= 0) {
+            artistCountFilter = { min: minCount };
+          }
+        }
+        // Handle "2-5" format (range)
+        else if (artistCountValue.includes('-')) {
+          const [minStr, maxStr] = artistCountValue.split('-').map(s => s.trim());
+          const minCount = parseInt(minStr);
+          const maxCount = parseInt(maxStr);
+          if (!isNaN(minCount) && !isNaN(maxCount) && minCount >= 0 && maxCount >= minCount) {
+            artistCountFilter = { min: minCount, max: maxCount };
+          }
+        }
+        // Handle exact number "3"
+        else {
+          const exactCount = parseInt(artistCountValue);
+          if (!isNaN(exactCount) && exactCount >= 0) {
+            artistCountFilter = { exact: exactCount };
+          }
+        }
+      }
+    }
+
+    // Build order clause for sorting
+    let order: any[] = [['name', 'ASC']];
+    switch (sort) {
+      case 'NAME_DESC':
+        order = [['name', 'DESC']];
+        break;
+      case 'ID_ASC':
+        order = [['id', 'ASC']];
+        break;
+      case 'ID_DESC':
+        order = [['id', 'DESC']];
+        break;
+    }
+
+    // Step 1: Collect all matching IDs (unpaginated)
+    let allMatchingIds: number[] = [];
+    let exactMatchIds: number[] = [];
+
+    if (searchString) {
+      // Check for #{ID} pattern
+      const idMatcher = /^#\d{1,20}$/.exec(searchString);
+      if (idMatcher) {
+        // Special ID matcher - bypass search conditionals
+        const targetId = parseInt(searchString.replace('#', ''));
+        allMatchingIds = [targetId];
+      } else {
+        // Normal search - separate exact matches from partial matches
+        const escapedSearch = escapeForMySQL(searchString);
+
+        // Find exact name matches (case-insensitive, sorted)
+        const exactNameMatches = await Song.findAll({
+          where: sequelize.where(
+            sequelize.fn('LOWER', sequelize.col('name')),
+            searchString.toLowerCase()
+          ),
+          attributes: ['id'],
+          order
+        });
+        exactMatchIds = exactNameMatches.map(s => s.id);
+
+        // Find exact alias matches (case-insensitive)
+        const exactAliasMatches = await SongAlias.findAll({
+          where: sequelize.where(
+            sequelize.fn('LOWER', sequelize.col('alias')),
+            searchString.toLowerCase()
+          ),
+          attributes: ['songId']
+        });
+        const exactAliasIds = Array.from(new Set(exactAliasMatches.map(a => a.songId)));
+
+        // Sort exact alias IDs by querying songs with those IDs
+        if (exactAliasIds.length > 0) {
+          const sortedExactAliasSongs = await Song.findAll({
+            where: { id: { [Op.in]: exactAliasIds } },
+            attributes: ['id'],
+            order
+          });
+          const sortedExactAliasIds = sortedExactAliasSongs.map(s => s.id);
+          exactMatchIds = [...exactMatchIds, ...sortedExactAliasIds];
+        }
+
+        // Remove duplicates from exact matches
+        exactMatchIds = Array.from(new Set(exactMatchIds));
+
+        // Find partial name matches (excluding exact matches, sorted)
+        const partialNameWhere: any = {
+          name: {
+            [Op.like]: `%${escapedSearch}%`
+          }
+        };
+        if (exactMatchIds.length > 0) {
+          partialNameWhere.id = {[Op.notIn]: exactMatchIds};
+        }
+        const partialNameMatches = await Song.findAll({
+          where: partialNameWhere,
+          attributes: ['id'],
+          order
+        });
+        const partialMatchIds = partialNameMatches.map(s => s.id);
+
+        // Find partial alias matches (excluding exact matches)
+        const partialAliasWhere: any = {
+          alias: {
+            [Op.like]: `%${escapedSearch}%`
+          }
+        };
+        if (exactMatchIds.length > 0) {
+          partialAliasWhere.songId = {[Op.notIn]: exactMatchIds};
+        }
+        const partialAliasMatches = await SongAlias.findAll({
+          where: partialAliasWhere,
+          attributes: ['songId']
+        });
+        const partialAliasIdsRaw = Array.from(new Set(partialAliasMatches.map(a => a.songId)));
+
+        // Sort partial alias IDs by querying songs with those IDs
+        let partialAliasIds: number[] = [];
+        if (partialAliasIdsRaw.length > 0) {
+          const sortedPartialAliasSongs = await Song.findAll({
+            where: { id: { [Op.in]: partialAliasIdsRaw } },
+            attributes: ['id'],
+            order
+          });
+          partialAliasIds = sortedPartialAliasSongs.map(s => s.id);
+        }
+
+        // Combine: exact matches first, then partial matches (both sorted)
+        allMatchingIds = [...exactMatchIds, ...Array.from(new Set([...partialMatchIds, ...partialAliasIds]))];
+      }
+    }
+
+    // Filter by artist(s) if provided - supports comma-separated IDs like "51,76"
+    let artistSongIds: number[] | null = null;
+    if (artistId) {
+      // Parse comma-separated artist IDs
+      const artistIds = (artistId as string)
+        .split(',')
+        .map(id => parseInt(id.trim()))
+        .filter(id => !isNaN(id) && id > 0);
+
+      if (artistIds.length > 0) {
+        if (artistIds.length === 1) {
+          // Single artist: simple query
+          const credits = await SongCredit.findAll({
+            where: {artistId: artistIds[0]},
+            attributes: ['songId']
+          });
+          artistSongIds = credits.map(c => c.songId);
+        } else {
+          // Multiple artists: find songs that have ALL specified artists
+          // Get all song IDs that have credits for any of the artists
+          const allCredits = await SongCredit.findAll({
+            where: {artistId: {[Op.in]: artistIds}},
+            attributes: ['songId', 'artistId']
+          });
+
+          // Group by songId and check if each song has all required artists
+          const songArtistMap = new Map<number, Set<number>>();
+          allCredits.forEach(credit => {
+            if (!songArtistMap.has(credit.songId)) {
+              songArtistMap.set(credit.songId, new Set());
+            }
+            songArtistMap.get(credit.songId)!.add(credit.artistId);
+          });
+
+          // Filter to only songs that have ALL the specified artists
+          artistSongIds = Array.from(songArtistMap.entries())
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            .filter(([songId, artistSet]) => {
+              // Check if this song has all required artists
+              return artistIds.every(id => artistSet.has(id));
+            })
+            .map(([songId]) => songId);
+        }
+      }
+    }
+
+    // Apply artist filter to search results if both are present
+    if (artistSongIds !== null && allMatchingIds.length > 0) {
+      allMatchingIds = allMatchingIds.filter(id => artistSongIds!.includes(id));
+      // Maintain order: exact matches first, then partial matches
+      const filteredExactIds = exactMatchIds.filter(id => artistSongIds!.includes(id));
+      const filteredPartialIds = allMatchingIds.filter(id => !exactMatchIds.includes(id));
+      allMatchingIds = [...filteredExactIds, ...filteredPartialIds];
+    } else if (artistSongIds !== null && allMatchingIds.length === 0) {
+      // No search but artist filter exists
+      allMatchingIds = artistSongIds;
+    }
+
+    // Apply artist count filter if specified
+    if (artistCountFilter) {
+      // Store in const to preserve type narrowing after async operations
+      const filter = artistCountFilter;
+
+      // Get songs with their artist counts
+      const songIdsToCheck = allMatchingIds.length > 0 ? allMatchingIds : null;
+
+      // Build query options for counting artists per song
+      const countQueryOptions: any = {
+        attributes: [
+          'songId',
+          [sequelize.fn('COUNT', sequelize.col('SongCredit.id')), 'artistCount']
+        ],
+        group: ['songId'],
+        raw: true
+      };
+
+      if (songIdsToCheck && songIdsToCheck.length > 0) {
+        countQueryOptions.where = { songId: { [Op.in]: songIdsToCheck } };
+      }
+
+      const songArtistCounts = await SongCredit.findAll(countQueryOptions) as any[];
+
+      // Create a map of songId -> artistCount
+      const artistCountMap = new Map<number, number>();
+      songArtistCounts.forEach((item: any) => {
+        artistCountMap.set(item.songId, parseInt(item.artistCount) || 0);
+      });
+
+      // If we're checking specific song IDs, also include songs with 0 artists
+      if (songIdsToCheck && songIdsToCheck.length > 0) {
+        songIdsToCheck.forEach(songId => {
+          if (!artistCountMap.has(songId)) {
+            artistCountMap.set(songId, 0);
+          }
+        });
+      } else {
+        // No search string - get all songs and check which have 0 artists
+        const allSongs = await Song.findAll({ attributes: ['id'] });
+        allSongs.forEach(song => {
+          if (!artistCountMap.has(song.id)) {
+            artistCountMap.set(song.id, 0);
+          }
+        });
+      }
+
+      // Filter songs based on artist count criteria
+      let filteredByArtistCount: number[] = [];
+
+      if (filter.exact !== undefined) {
+        // Exact count match (including 0 artists)
+        filteredByArtistCount = Array.from(artistCountMap.entries())
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          .filter(([_, count]) => count === filter.exact)
+          .map(([songId]) => songId);
+      } else if (filter.min !== undefined && filter.max !== undefined) {
+        // Range match
+        filteredByArtistCount = Array.from(artistCountMap.entries())
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          .filter(([_, count]) => count >= filter.min! && count <= filter.max!)
+          .map(([songId]) => songId);
+      } else if (filter.min !== undefined) {
+        // Minimum count match (e.g., "2+")
+        filteredByArtistCount = Array.from(artistCountMap.entries())
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          .filter(([_, count]) => count >= filter.min!)
+          .map(([songId]) => songId);
+      }
+
+      // Apply filter to existing results
+      if (allMatchingIds.length > 0) {
+        allMatchingIds = allMatchingIds.filter(id => filteredByArtistCount.includes(id));
+        exactMatchIds = exactMatchIds.filter(id => filteredByArtistCount.includes(id));
+      } else {
+        // No search string, just filter by artist count
+        // Sort the filtered results according to the order clause
+        if (filteredByArtistCount.length > 0) {
+          const sortedSongs = await Song.findAll({
+            where: { id: { [Op.in]: filteredByArtistCount } },
+            attributes: ['id'],
+            order
+          });
+          allMatchingIds = sortedSongs.map(s => s.id);
+        } else {
+          allMatchingIds = filteredByArtistCount;
+        }
+      }
+    }
+
+    // Apply verification state filter if specified
+    if (verificationState && allMatchingIds.length > 0) {
+      const filterWhere: any = {
+        id: {[Op.in]: allMatchingIds},
+      };
+      filterWhere.verificationState = verificationState;
+      const filteredSongs = await Song.findAll({
+        where: filterWhere,
+        attributes: ['id'],
+        order
+      });
+      const filteredIds = filteredSongs.map(s => s.id);
+
+      // Maintain order: exact matches first, then partial matches
+      const filteredExactIds = exactMatchIds.filter(id => filteredIds.includes(id));
+      const filteredPartialIds = allMatchingIds.filter(id => !exactMatchIds.includes(id) && filteredIds.includes(id));
+      allMatchingIds = [...filteredExactIds, ...filteredPartialIds];
+    }
+
+    // Step 2: Paginate the IDs array
+    const totalCount = allMatchingIds.length;
+    const paginatedIds = allMatchingIds.slice(offset, offset + limit);
+
+    // Step 3: Query with paginated IDs (or normal query if no search)
+    let finalWhere: any = {};
+    let queryOptions: any = {
+      order,
+      include: [
+        {
+          model: SongAlias,
+          as: 'aliases',
+          attributes: ['id', 'alias']
+        },
+        {
+          model: SongEvidence,
+          as: 'evidences',
+          attributes: ['id', 'link']
+        },
+        {
+          model: SongCredit,
+          as: 'credits',
+          include: [
+            {
+              model: Artist,
+              as: 'artist',
+              attributes: ['id', 'name', 'avatarUrl']
+            }
+          ]
+        }
+      ]
+    };
+
+    if (searchString && paginatedIds.length > 0) {
+      // Use paginated IDs - already paginated, no limit/offset needed
+      finalWhere.id = {[Op.in]: paginatedIds};
+      queryOptions.where = finalWhere;
+    } else if (searchString && paginatedIds.length === 0) {
+      // No matches found
+      return res.json({
+        songs: [],
+        total: 0,
+        page,
+        offset,
+        limit,
+        hasMore: false
+      });
+    } else {
+      // No search string - apply filters if specified
+      // Check if we have filtered IDs from artist count filter or artist filter
+      if (allMatchingIds.length > 0) {
+        // We have filtered IDs (from artist count filter or artist filter)
+        finalWhere.id = {[Op.in]: paginatedIds};
+        queryOptions.where = finalWhere;
+      } else {
+        // No filters at all - apply verification state if specified
+        if (verificationState) {
+          finalWhere.verificationState = verificationState;
+        }
+        if (artistSongIds !== null) {
+          finalWhere.id = {[Op.in]: artistSongIds};
+        }
+        queryOptions.where = finalWhere;
+        queryOptions.limit = limit;
+        queryOptions.offset = offset;
+      }
+    }
+
+    // Step 4: Fetch songs with all required includes
+    const {count, rows} = await Song.findAndCountAll(queryOptions);
+
+    // Step 5: Sort results to maintain exact matches first (if we had a search)
+    let sortedRows = rows;
+    if (searchString && exactMatchIds.length > 0 && paginatedIds.length > 0) {
+      sortedRows = rows.sort((a, b) => {
+        const aIsExact = exactMatchIds.includes(a.id);
+        const bIsExact = exactMatchIds.includes(b.id);
+
+        if (aIsExact && !bIsExact) return -1;
+        if (!aIsExact && bIsExact) return 1;
+
+        // Both in same category - maintain order from paginatedIds
+        const aIndex = paginatedIds.indexOf(a.id);
+        const bIndex = paginatedIds.indexOf(b.id);
+        return aIndex - bIndex;
+      });
+    }
+
+    const finalCount = searchString ? totalCount : count;
+
+    return res.json({
+      songs: sortedRows,
+      total: finalCount,
+      page,
+      offset,
+      limit,
+      hasMore: sortedRows.length > 0 && offset + limit < finalCount
+    });
+  } catch (error) {
+    logger.error('Error fetching songs:', error);
+    return res.status(500).json({error: 'Failed to fetch songs'});
+  }
+  }
+);
+
+// Get level info (count and suffix distribution) for a song
+// Must be before the general GET /:id route
+router.get(
+  '/:id([0-9]{1,20})/levels/info',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'getSongLevelsInfo',
+    summary: 'Song levels info',
+    description: 'Level count and suffix distribution for a song. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    responses: { 200: { description: 'Levels info' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const songId = parseInt(req.params.id);
+
+    // Verify song exists
+    const song = await Song.findByPk(songId);
+    if (!song) {
+      return res.status(404).json({error: 'Song not found'});
+    }
+
+    // Get all levels with this songId
+    const levels = await Level.findAll({
+      where: { songId },
+      attributes: ['id', 'suffix']
+    });
+
+    return res.json({
+      levels: levels,
+      count: levels.length
+    });
+  } catch (error) {
+    logger.error('Error fetching level info:', error);
+    return res.status(500).json({error: 'Failed to fetch level info'});
+  }
+  }
+);
+
+// Get public song detail page
+router.get(
+  '/:id([0-9]{1,20})',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getSong',
+    summary: 'Get song',
+    description: 'Get song by ID with aliases, links, evidences, credits, and levels.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    responses: { 200: { description: 'Song detail' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const song = await Song.findByPk(req.params.id, {
+      include: [
+        {
+          model: SongAlias,
+          as: 'aliases',
+          attributes: ['id', 'alias']
+        },
+        {
+          model: SongLink,
+          as: 'links',
+          attributes: ['id', 'link']
+        },
+        {
+          model: SongEvidence,
+          as: 'evidences',
+          attributes: ['id', 'link']
+        },
+        {
+          model: SongCredit,
+          as: 'credits',
+          include: [
+            {
+              model: Artist,
+              as: 'artist',
+              attributes: ['id', 'name', 'avatarUrl', 'verificationState']
+            }
+          ]
+        }
+      ]
+    });
+
+    if (!song) {
+      return res.status(404).json({error: 'Song not found'});
+    }
+
+    const levelsResult = await elasticsearchService.searchLevels('', {
+      songId: song.id,
+      limit: 100,
+      offset: 0
+    });
+
+    const levels = await annotateLevelsWithLikeState(
+      levelsResult.hits || [],
+      req.user?.id,
+    );
+
+    return res.json({
+      ...song.toJSON(),
+      levels,
+    });
+  } catch (error) {
+    logger.error('Error fetching song:', error);
+    return res.status(500).json({error: 'Failed to fetch song'});
+  }
+  }
+);
+
+// Get evidence images (public read-only)
+router.get(
+  '/:id([0-9]{1,20})/evidences',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getSongEvidences',
+    summary: 'Song evidences',
+    description: 'Get evidence images/links for a song.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    responses: { 200: { description: 'Evidences list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const evidences = await evidenceService.getEvidenceForSong(parseInt(req.params.id));
+    return res.json(evidences);
+  } catch (error) {
+    logger.error('Error fetching evidence:', error);
+    return res.status(500).json({error: 'Failed to fetch evidence'});
+  }
+  }
+);
+
+// Create new song
+router.post(
+  '/',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSong',
+    summary: 'Create song',
+    description: 'Create a song. Body: name, verificationState?, aliases?. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'name, verificationState, aliases', schema: { type: 'object', properties: { name: { type: 'string' }, verificationState: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } } }, required: ['name'] }, required: true },
+    responses: { 200: { description: 'Song created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {name, verificationState, aliases} = req.body;
+
+    if (!name || typeof name !== 'string') {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Name is required'});
+    }
+
+    const song = await Song.create({
+      name: name.trim(),
+      verificationState: verificationState || 'pending'
+    }, {transaction});
+
+    // Add aliases if provided
+    if (aliases && Array.isArray(aliases) && aliases.length > 0) {
+      const uniqueAliases = [...new Set(aliases.map((a: string) => a.trim()).filter((a: string) => a))];
+      if (uniqueAliases.length > 0) {
+        await SongAlias.bulkCreate(
+          uniqueAliases.map(alias => ({
+            songId: song.id,
+            alias: alias.trim()
+          })),
+          {
+            transaction,
+            ignoreDuplicates: true // Prevent duplicate songId+alias combinations
+          }
+        );
+      }
+    }
+
+    await transaction.commit();
+    return res.json(song);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error creating song:', error);
+    return res.status(500).json({error: 'Failed to create song'});
+  }
+  }
+);
+
+// Update song
+router.put(
+  '/:id([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putSong',
+    summary: 'Update song',
+    description: 'Update song name, verificationState, extraInfo. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'name, verificationState, extraInfo', schema: { type: 'object', properties: { name: { type: 'string' }, verificationState: { type: 'string' }, extraInfo: { type: 'string' } } }, required: true },
+    responses: { 200: { description: 'Song updated' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const song = await Song.findByPk(req.params.id, {transaction});
+    if (!song) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({error: 'Song not found'});
+    }
+
+    const {name, verificationState, extraInfo} = req.body;
+
+    if (name && typeof name === 'string') {
+      song.name = name.trim();
+    }
+    if (verificationState) {
+      song.verificationState = verificationState;
+    }
+    if (extraInfo !== undefined) {
+      song.extraInfo = extraInfo === null || extraInfo === '' ? null : String(extraInfo).trim();
+    }
+
+    await song.save({transaction});
+    await transaction.commit();
+
+    return res.json(song);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error updating song:', error);
+    return res.status(500).json({error: 'Failed to update song'});
+  }
+  }
+);
+
+// Delete song (with checks)
+router.delete(
+  '/:id([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteSong',
+    summary: 'Delete song',
+    description: 'Delete song if not used by any level. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    responses: { 200: { description: 'Song deleted' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const song = await Song.findByPk(req.params.id, {transaction});
+    if (!song) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({error: 'Song not found'});
+    }
+
+    // Check if song is used in levels
+    const levelCount = await Level.count({
+      where: {songId: song.id},
+      transaction
+    });
+
+    if (levelCount > 0) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({
+        error: `Cannot delete song: used in ${levelCount} level(s)`
+      });
+    }
+
+    await song.destroy({transaction});
+    await transaction.commit();
+
+    return res.json({success: true});
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error deleting song:', error);
+    return res.status(500).json({error: 'Failed to delete song'});
+  }
+  }
+);
+
+// Merge song into another
+router.post(
+  '/:id([0-9]{1,20})/merge',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongMerge',
+    summary: 'Merge songs',
+    description: 'Merge this song into target song. Body: targetId. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'targetId', schema: { type: 'object', properties: { targetId: { type: 'integer' } }, required: ['targetId'] }, required: true },
+    responses: { 200: { description: 'Merge success' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {targetId} = req.body;
+    if (!targetId) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Target ID is required'});
+    }
+
+    await songService.mergeSongs(parseInt(req.params.id), parseInt(targetId));
+    await transaction.commit();
+
+    return res.json({success: true});
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error merging songs:', error);
+    return res.status(500).json({error: 'Failed to merge songs'});
+  }
+  }
+);
+
+// Add alias
+router.post(
+  '/:id([0-9]{1,20})/aliases',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongAlias',
+    summary: 'Add song alias',
+    description: 'Add alias for a song. Body: alias. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'alias', schema: { type: 'object', properties: { alias: { type: 'string' } }, required: ['alias'] }, required: true },
+    responses: { 200: { description: 'Alias created' }, 400: { schema: errorResponseSchema }, 409: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {alias} = req.body;
+    if (!alias || typeof alias !== 'string') {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Alias is required'});
+    }
+
+    // Check if alias already exists for this song
+    const existingAlias = await SongAlias.findOne({
+      where: {
+        songId: parseInt(req.params.id),
+        alias: alias.trim()
+      },
+      transaction
+    });
+
+    if (existingAlias) {
+      await safeTransactionRollback(transaction);
+      return res.status(409).json({error: 'Alias already exists for this song'});
+    }
+
+    const songAlias = await SongAlias.create({
+      songId: parseInt(req.params.id),
+      alias: alias.trim()
+    }, {transaction});
+
+    await transaction.commit();
+    return res.json(songAlias);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error adding alias:', error);
+    return res.status(500).json({error: 'Failed to add alias'});
+  }
+  }
+);
+
+// Delete alias
+router.delete(
+  '/:id([0-9]{1,20})/aliases/:aliasId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteSongAlias',
+    summary: 'Delete song alias',
+    description: 'Delete alias by id. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, aliasId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Alias deleted' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const alias = await SongAlias.findOne({
+      where: {
+        id: req.params.aliasId,
+        songId: req.params.id
+      }
+    });
+
+    if (!alias) {
+      return res.status(404).json({error: 'Alias not found'});
+    }
+
+    await alias.destroy();
+    return res.json({success: true});
+  } catch (error) {
+    logger.error('Error deleting alias:', error);
+    return res.status(500).json({error: 'Failed to delete alias'});
+  }
+  }
+);
+
+// Add link
+router.post(
+  '/:id([0-9]{1,20})/links',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongLink',
+    summary: 'Add song link',
+    description: 'Add link for a song. Body: link. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'link', schema: { type: 'object', properties: { link: { type: 'string' } }, required: ['link'] }, required: true },
+    responses: { 200: { description: 'Link created' }, 400: { schema: errorResponseSchema }, 409: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {link} = req.body;
+    if (!link || typeof link !== 'string') {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Link is required'});
+    }
+
+    // Check if link already exists for this song
+    const existingLink = await SongLink.findOne({
+      where: {
+        songId: parseInt(req.params.id),
+        link: link.trim()
+      },
+      transaction
+    });
+
+    if (existingLink) {
+      await safeTransactionRollback(transaction);
+      return res.status(409).json({error: 'Link already exists for this song'});
+    }
+
+    const songLink = await SongLink.create({
+      songId: parseInt(req.params.id),
+      link: link.trim()
+    }, {transaction});
+
+    await transaction.commit();
+    return res.json(songLink);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error adding link:', error);
+    return res.status(500).json({error: 'Failed to add link'});
+  }
+  }
+);
+
+// Delete link
+router.delete(
+  '/:id([0-9]{1,20})/links/:linkId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteSongLink',
+    summary: 'Delete song link',
+    description: 'Delete link by id. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, linkId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Link deleted' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const link = await SongLink.findOne({
+      where: {
+        id: req.params.linkId,
+        songId: req.params.id
+      }
+    });
+
+    if (!link) {
+      return res.status(404).json({error: 'Link not found'});
+    }
+
+    await link.destroy();
+    return res.json({success: true});
+  } catch (error) {
+    logger.error('Error deleting link:', error);
+    return res.status(500).json({error: 'Failed to delete link'});
+  }
+  }
+);
+
+// Add evidence (managers only)
+router.post(
+  '/:id([0-9]{1,20})/evidences',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongEvidence',
+    summary: 'Add song evidence',
+    description: 'Add evidence link for a song. Body: link. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'link', schema: { type: 'object', properties: { link: { type: 'string' } }, required: ['link'] }, required: true },
+    responses: { 200: { description: 'Evidence created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {link} = req.body;
+    if (!link || typeof link !== 'string') {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Link is required'});
+    }
+
+    const evidence = await evidenceService.addEvidenceToSong(
+      parseInt(req.params.id),
+      link.trim(),
+      transaction
+    );
+
+    await transaction.commit();
+    return res.json(evidence);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error adding evidence:', error);
+    return res.status(500).json({error: 'Failed to add evidence'});
+  }
+  }
+);
+
+// Upload evidence images (managers only)
+router.post(
+  '/:id([0-9]{1,20})/evidences/upload',
+  Auth.superAdmin(),
+  upload.array('evidence', 10),
+  ApiDoc({
+    operationId: 'postSongEvidencesUpload',
+    summary: 'Upload evidence images',
+    description: 'Upload evidence images (multipart, up to 10). Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'multipart evidence files', schema: { type: 'object' }, required: true },
+    responses: { 200: { description: 'Evidences created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'No files uploaded'});
+    }
+
+    const evidences = [];
+
+    for (const file of files) {
+      // Upload to CDN
+      const uploadResult = await cdnServiceInstance.uploadImage(
+        file.buffer,
+        file.originalname,
+        'EVIDENCE'
+      );
+
+      const cdnUrl = uploadResult.urls.original;
+
+      // Create evidence record
+      const evidence = await evidenceService.addEvidenceToSong(
+        parseInt(req.params.id),
+        cdnUrl,
+        transaction
+      );
+      evidences.push(evidence);
+    }
+
+    await transaction.commit();
+    return res.json({evidences});
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+
+    // Check if it's a CdnError and propagate the actual error details
+    if (error instanceof CdnError) {
+      return respondWithCdnError(res, error);
+    }
+
+    logger.error('Error uploading evidence:', error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to upload evidence',
+    });
+  }
+  }
+);
+
+// Update evidence (managers only) - only for external links
+router.put(
+  '/:id([0-9]{1,20})/evidences/:evidenceId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putSongEvidence',
+    summary: 'Update song evidence',
+    description: 'Update evidence link (external links only). Body: link. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, evidenceId: { schema: { type: 'string' } } },
+    requestBody: { description: 'link', schema: { type: 'object', properties: { link: { type: 'string' } }, required: ['link'] }, required: true },
+    responses: { 200: { description: 'Evidence updated' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {link} = req.body;
+    if (!link || typeof link !== 'string') {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Link is required'});
+    }
+
+    const evidence = await evidenceService.updateSongEvidence(
+      parseInt(req.params.evidenceId),
+      link.trim()
+    );
+
+    await transaction.commit();
+    return res.json(evidence);
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error updating evidence:', error);
+    if (error.message && error.message.includes('Cannot update CDN')) {
+      return res.status(400).json({error: error.message});
+    }
+    return res.status(500).json({error: 'Failed to update evidence'});
+  }
+  }
+);
+
+// Delete evidence
+router.delete(
+  '/:id([0-9]{1,20})/evidences/:evidenceId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteSongEvidence',
+    summary: 'Delete song evidence',
+    description: 'Delete evidence by id. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, evidenceId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Evidence deleted' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    await evidenceService.deleteSongEvidence(parseInt(req.params.evidenceId));
+    return res.json({success: true});
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to delete evidence';
+    const statusCode = message === 'Evidence not found' ? 404 : 500;
+    if (statusCode >= 500) logger.error('Error deleting evidence:', error);
+    return res.status(statusCode).json({ error: message });
+  }
+  }
+);
+
+// Add artist credit
+router.post(
+  '/:id([0-9]{1,20})/credits',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongCredit',
+    summary: 'Add song credit',
+    description: 'Add artist credit. Body: artistId, role?. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'artistId, role', schema: { type: 'object', properties: { artistId: { type: 'integer' }, role: { type: 'string' } }, required: ['artistId'] }, required: true },
+    responses: { 200: { description: 'Credit created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const {artistId, role} = req.body;
+    if (!artistId) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({error: 'Artist ID is required'});
+    }
+
+    const credit = await songService.addArtistCredit(
+      parseInt(req.params.id),
+      parseInt(artistId),
+      role || null
+    );
+
+    await transaction.commit();
+    return res.json(credit);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error adding credit:', error);
+    return res.status(500).json({error: 'Failed to add credit'});
+  }
+  }
+);
+
+// Remove credit
+router.delete(
+  '/:id([0-9]{1,20})/credits/:creditId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteSongCredit',
+    summary: 'Delete song credit',
+    description: 'Remove artist credit by id. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, creditId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Credit deleted' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const credit = await SongCredit.findOne({
+      where: {
+        id: req.params.creditId,
+        songId: req.params.id
+      }
+    });
+
+    if (!credit) {
+      return res.status(404).json({error: 'Credit not found'});
+    }
+
+    await credit.destroy();
+    return res.json({success: true});
+  } catch (error) {
+    logger.error('Error deleting credit:', error);
+    return res.status(500).json({error: 'Failed to delete credit'});
+  }
+  }
+);
+
+// Bulk update level suffix for all levels with this song
+router.post(
+  '/:id([0-9]{1,20})/levels/suffix',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postSongLevelsSuffix',
+    summary: 'Bulk update level suffix',
+    description: 'Set suffix for all levels with this song. Body: suffix. Super admin.',
+    tags: ['Database', 'Songs'],
+    security: ['bearerAuth'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'suffix', schema: { type: 'object', properties: { suffix: { type: 'string' } } }, required: true },
+    responses: { 200: { description: 'Updated count' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const songId = parseInt(req.params.id);
+    const { suffix } = req.body;
+
+    // Verify song exists
+    const song = await Song.findByPk(songId, { transaction });
+    if (!song) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({error: 'Song not found'});
+    }
+
+    const levels = await Level.findAll({
+      where: { songId },
+      attributes: ['id'],
+      transaction,
+    });
+
+    // Normalize suffix: trim whitespace, set to null if empty string
+    const normalizedSuffix = suffix && typeof suffix === 'string'
+      ? suffix.trim() || null
+      : null;
+
+    const legacySongName = getSongDisplayName({
+      songObject: song,
+      suffix: normalizedSuffix,
+    });
+
+    // Update all levels with this songId (suffix + legacy joined song field)
+    const [updatedCount] = await Level.update(
+      { suffix: normalizedSuffix, song: legacySongName },
+      {
+        where: { songId },
+        transaction
+      }
+    );
+
+    await transaction.commit();
+
+    const levelIds = levels.map((level) => level.id);
+    if (levelIds.length > 0) {
+      await elasticsearchService.reindexLevels(levelIds);
+    }
+    return res.json({
+      success: true,
+      updatedCount,
+      suffix: normalizedSuffix
+    });
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error updating level suffix:', error);
+    return res.status(500).json({error: 'Failed to update level suffix'});
+  }
+  }
+);
+
+export default router;

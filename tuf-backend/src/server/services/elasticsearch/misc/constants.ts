@@ -1,0 +1,20 @@
+export const MAX_BATCH_SIZE = 4000;
+export const BATCH_SIZE = 500;
+/** Full-table ES rebuilds: keep one page of Sequelize graphs under the API heap cap. */
+export const FULL_REINDEX_PAGE_SIZE = 500;
+
+/** Debounce window for batched artist-related level reindexes (ms). */
+export const ARTIST_REINDEX_DEBOUNCE_MS = 30000;
+
+/** Max time to hold pass CDC work before flushing without an idle signal (ms). */
+export const CDC_PASS_MAX_COALESCE_MS = 30_000;
+
+/**
+ * Coalesce window for level_credits CDC effects (ms). A single level credit
+ * edit emits one event per removed + added row; this batches that burst into a
+ * single level reindex + bulk creator reindex.
+ */
+export const CDC_LEVEL_CREDITS_COALESCE_MS = 2_000;
+
+/** BLOCK timeout on `cdc:passes` consumer — shorter = faster idle detection after backlog. */
+export const CDC_PASSES_STREAM_BLOCK_MS = 1000;

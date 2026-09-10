@@ -1,0 +1,203 @@
+import {IPassSubmission} from '@/server/interfaces/models/index.js';
+import {calcAcc, IJudgements, tilecount} from './CalcAcc.js';
+import {
+  xaccMultiplier as xaccCurveMultiplier,
+  type XaccCurveConfig,
+  resolveXaccCurveForLevelData,
+} from './scoreV2XaccCurve.js';
+
+const gmConst = 315;
+const start = 1;
+const end = 50;
+const startDeduc = 10;
+const endDeduc = 50;
+const pwr = 0.7;
+
+/** Applied when miss count is zero (matches plotted zero-miss ScoreV2 curve). */
+export const SCORE_V2_ZERO_MISS_MULTIPLIER = 1.1;
+
+export const getScoreV2Mtp = (inputs: IJudgements) => {
+  const misses = inputs.earlyDouble;
+
+  const tiles = tilecount(inputs);
+
+  if (!misses) {
+    return SCORE_V2_ZERO_MISS_MULTIPLIER;
+  }
+  const tp = (start + end) / 2;
+  const tpDeduc = (startDeduc + endDeduc) / 2;
+  const am = Math.max(0, misses - Math.floor(tiles / gmConst));
+  if (am === 0) {
+    return 1;
+  } else if (am <= start) {
+    return 1 - startDeduc / 100;
+  }
+  if (am <= tp) {
+    const kOne =
+      (Math.pow((am - start) / (tp - start), pwr) * (tpDeduc - startDeduc)) /
+      100;
+    return 1 - startDeduc / 100 - kOne;
+  } else if (am <= end) {
+    const kTwo =
+      (Math.pow((end - am) / (end - tp), pwr) * (endDeduc - tpDeduc)) / 100;
+    return 1 + kTwo - endDeduc / 100;
+  } else {
+    return 1 - endDeduc / 100;
+  }
+};
+
+/** Miss-debuff multiplier for a miss count and hit-tile count (zero misses → 1.1). */
+export function scoreV2MtpFromMisses(misses: number, hitTiles: number): number {
+  const m = Math.max(0, Math.floor(Number(misses)) || 0);
+  const hits = Math.max(0, Math.floor(Number(hitTiles)) || 0);
+  if (hits <= 0) {
+    return m === 0 ? SCORE_V2_ZERO_MISS_MULTIPLIER : 1;
+  }
+  return getScoreV2Mtp({
+    earlyDouble: m,
+    earlySingle: 0,
+    ePerfect: 0,
+    perfect: hits,
+    lPerfect: 0,
+    lateSingle: 0,
+    lateDouble: 0,
+  });
+}
+
+const getXaccMtp = (
+  inp: IJudgements,
+  baseScore: number,
+  curveOverrides?: XaccCurveConfig | null,
+) => {
+  const xacc = calcAcc(inp);
+  return xaccCurveMultiplier(xacc, baseScore, curveOverrides);
+};
+
+/** Standard speed multiplier (Marathon / desync-bus branch removed). */
+export const getSpeedMtp = (speed: number) => {
+  if (!speed || speed === 1) {
+    return 1;
+  }
+  if (speed < 1) {
+    return 0;
+  }
+  if (speed < 1.1) {
+    return -3.5 * speed + 4.5;
+  }
+  if (speed < 1.5) {
+    return 0.65;
+  }
+  if (speed < 2) {
+    return 0.7 * speed - 0.4;
+  }
+  return 1;
+};
+
+/**
+ * Prefer level override, else difficulty baseScore; PP uses ppBaseScore at 100% xacc.
+ * Level/pp `0` is unset (NULLIF); difficulty `0` is a valid last-resort base.
+ */
+export function resolveScoreBase(
+  levelData: LevelData,
+  accuracy: number,
+): number {
+  if (
+    accuracy === 1 &&
+    levelData.ppBaseScore != null &&
+    Number.isFinite(levelData.ppBaseScore) &&
+    levelData.ppBaseScore > 0
+  ) {
+    return levelData.ppBaseScore;
+  }
+  if (
+    levelData.baseScore != null &&
+    Number.isFinite(levelData.baseScore) &&
+    levelData.baseScore > 0
+  ) {
+    return levelData.baseScore;
+  }
+  const fromDiff = levelData.difficulty?.baseScore;
+  if (fromDiff != null && Number.isFinite(fromDiff)) {
+    return fromDiff;
+  }
+  return 0;
+}
+
+const getScore = (passData: PassData, levelData: LevelData) => {
+  const speed = Number.isFinite(passData.speed) ? passData.speed : 1;
+  const inputs = passData.judgements;
+  const accuracy = calcAcc(inputs);
+  const base = resolveScoreBase(levelData, accuracy);
+  const xaccMtp = getXaccMtp(
+    inputs,
+    base,
+    resolveXaccCurveForLevelData(levelData),
+  );
+  const speedMtp = getSpeedMtp(speed);
+  return base * xaccMtp * speedMtp;
+};
+
+export interface LevelData {
+  baseScore?: number | null;
+  ppBaseScore?: number | null;
+  diff?: number;
+  difficulty?: {
+    name?: string | null;
+    baseScore?: number | null;
+  } | null;
+  xaccCurveMeta?: unknown | null;
+  xaccCurve?: XaccCurveConfig | null;
+}
+
+interface PassData {
+  speed: number;
+  judgements: IJudgements;
+  isNoHoldTap: boolean;
+}
+
+// Declare the overloads
+export function getScoreV2(passData: PassData, levelData: LevelData): number;
+export function getScoreV2(
+  passSubmission: IPassSubmission,
+  levelData: LevelData,
+): number;
+// Implement the function with a union type
+export function getScoreV2(
+  input: PassData | IPassSubmission,
+  levelData: LevelData,
+): number {
+  // Type guard to determine which type we're dealing with
+  const isPassSubmission = (
+    input: PassData | IPassSubmission,
+  ): input is IPassSubmission => 'judgements' in input && 'flags' in input;
+
+  if (isPassSubmission(input)) {
+    const inputs: IJudgements = input.judgements || {
+      earlyDouble: 0,
+      earlySingle: 0,
+      ePerfect: 5,
+      perfect: 40,
+      lPerfect: 5,
+      lateSingle: 0,
+      lateDouble: 0,
+    };
+    const passData = {
+      speed: input.speed || 1,
+      judgements: inputs,
+      isNoHoldTap: input.flags?.isNoHoldTap || false,
+    };
+    const scoreOrig = getScore(passData, levelData);
+    let mtp = getScoreV2Mtp(inputs);
+    if (input.flags?.isNoHoldTap === true) {
+      mtp *= 0.95;
+    }
+    return scoreOrig * mtp;
+  } else {
+    const scoreOrig = getScore(input, levelData);
+    let mtp = getScoreV2Mtp(input.judgements);
+    if (input.isNoHoldTap === true) {
+      mtp *= 0.95;
+    }
+    return scoreOrig * mtp;
+  }
+}

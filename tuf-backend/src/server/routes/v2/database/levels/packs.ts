@@ -1,0 +1,2850 @@
+import { Router, Request, Response } from 'express';
+import { createHash, randomUUID } from 'crypto';
+import { Auth } from '@/server/middleware/auth.js';
+import { LevelPack, LevelPackItem, PackFavorite, LevelPackViewModes } from '@/models/packs/index.js';
+import Level from '@/models/levels/Level.js';
+import { User } from '@/models/index.js';
+import { Op } from 'sequelize';
+import sequelize from '@/config/db.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { hasFlag } from '@/misc/utils/auth/permissionUtils.js';
+import { permissionFlags } from '@/config/constants.js';
+import { safeTransactionRollback } from '@/misc/utils/Utility.js';
+import { mapMysqlClientError } from '@/misc/utils/db/mysqlClientError.js';
+import { parseSearchQuery,  queryParserConfigs, type SearchGroup } from '@/misc/utils/data/queryParser.js';
+import { getFileIdFromCdnUrl, isCdnUrl } from '@/misc/utils/Utility.js';
+import { multerMemoryCdnImage5Mb as upload } from '@/config/multerMemoryUploads.js';
+import cdnService from '@/server/services/core/CdnService.js';
+import { CdnError, respondWithCdnError } from '@/server/services/core/CdnService.js';
+import { jobProgressService } from '@/server/services/core/JobProgressService.js';
+import Pass from '@/models/passes/Pass.js';
+import Curation from '@/models/curations/Curation.js';
+import CurationType from '@/models/curations/CurationType.js';
+import LevelCredit from '@/models/levels/LevelCredit.js';
+import Creator from '@/models/credits/Creator.js';
+import Team from '@/models/credits/Team.js';
+import { Cache, CacheInvalidation } from '@/server/middleware/cache.js';
+import {
+  hydratePackItemRowsWithReferencedLevels,
+  invalidatePackLevelsCachesForLevelIds,
+  invalidatePackStructureLayers,
+  packDetailLayerTagsForFullInvalidation,
+  resolvePackItemsWithStackedCache,
+} from '@/server/services/packs/packDetailCacheService.js';
+import { prunePackCdnMetadataForThirdParty } from '@/server/services/packs/prunePackCdnMetadataForThirdParty.js';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import { standardErrorResponses, standardErrorResponses404500, standardErrorResponses500, errorResponseSchema } from '@/server/schemas/v2/database/levels/index.js';
+import { getSongDisplayName } from '@/misc/utils/data/levelHelpers.js';
+import { annotateReferencedLevelsWithLikeState } from '@/misc/utils/data/levelLikeState.js';
+import { incrementLevelDownloadCountsForFileIds } from '@/misc/utils/data/levelDownloadCount.js';
+import { stringIdParamSpec } from '@/server/schemas/common.js';
+import { isTufStellarAccessActive } from '@/misc/utils/subscriptions/tufStellarSubscription.js';
+import { loadUserTufStellarBilling } from '@/server/services/billing/userTufStellarBillingSupport.js';
+import { PaginationQuery } from '@/server/interfaces/models/index.js';
+
+const router: Router = Router();
+
+// Constants
+const DEFAULT_MAX_PACKS_PER_USER = 20;
+const TUF_STELLAR_MAX_PACKS_PER_USER = 100;
+const DEFAULT_MAX_ITEMS_PER_PACK = 250;
+const TUF_STELLAR_MAX_ITEMS_PER_PACK = 2500;
+const DEFAULT_LIMIT = 30;
+const MAX_LIMIT = 100;
+const CDN_METADATA_BATCH_SIZE = 100; // Batch CDN metadata requests to prevent OOM
+const PACK_CDN_METADATA_BATCH_TIMEOUT_MS = 15_000;
+const PACK_DESCRIPTION_MAX_LENGTH = 2000;
+
+/** Trim pack description; blank → null. Throws { error, code: 400 } if invalid. */
+function normalizePackDescription(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    throw { error: 'Pack description must be a string', code: 400 };
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > PACK_DESCRIPTION_MAX_LENGTH) {
+    throw { error: `Pack description cannot exceed ${PACK_DESCRIPTION_MAX_LENGTH} characters`, code: 400 };
+  }
+  return trimmed;
+}
+
+async function resolvePackQuotaForUser(user: NonNullable<Request['user']>): Promise<{ maxPacks: number; maxItems: number }> {
+  if (hasFlag(user, permissionFlags.SUPER_ADMIN)) {
+    return { maxPacks: Number.MAX_SAFE_INTEGER, maxItems: Number.MAX_SAFE_INTEGER };
+  }
+  const billing = await loadUserTufStellarBilling(user.id);
+  if (isTufStellarAccessActive(user, billing)) {
+    return { maxPacks: TUF_STELLAR_MAX_PACKS_PER_USER, maxItems: TUF_STELLAR_MAX_ITEMS_PER_PACK };
+  }
+  return { maxPacks: DEFAULT_MAX_PACKS_PER_USER, maxItems: DEFAULT_MAX_ITEMS_PER_PACK };
+}
+
+// Helper function to check if user can view pack
+const canViewPack = (pack: LevelPack, user: any): boolean => {
+  if (!pack) return false;
+
+  // Owner can always view their own packs
+  if (user && pack.ownerId === user.id) return true;
+
+  // Admin can view all packs
+  if (user && hasFlag(user, permissionFlags.SUPER_ADMIN)) return true;
+
+  // Check view mode
+  switch (pack.viewMode) {
+    case LevelPackViewModes.PUBLIC:
+      return true;
+    case LevelPackViewModes.LINKONLY:
+      return true;
+    case LevelPackViewModes.PRIVATE:
+      return false;
+    case LevelPackViewModes.FORCED_PRIVATE:
+      return false;
+    default:
+      return false;
+  }
+};
+
+// Helper function to check if user can edit pack
+const canEditPack = (pack: LevelPack, user: any): boolean => {
+  if (!user || !pack) return false;
+
+  // Owner can edit their own packs (unless forced private)
+  if (pack.ownerId === user.id && pack.viewMode !== LevelPackViewModes.FORCED_PRIVATE) {
+    return true;
+  }
+
+  // Admin can edit all packs
+  return hasFlag(user, permissionFlags.SUPER_ADMIN);
+};
+
+// Helper function to build tree recursively from items
+const buildItemTree = (items: any[], parentId = 0): any[] => {
+  const children = items.filter(item => {
+    // Handle both Sequelize model instances and plain objects
+    const itemParentId = item.parentId;
+    return itemParentId === parentId;
+  });
+
+  // CRITICAL: Sort by sortOrder ONLY - no other sorting criteria
+  children.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+
+  return children.map(item => {
+    // Handle both Sequelize model instances and plain objects
+    const itemId = item.id;
+    const subChildren = buildItemTree(items, itemId);
+
+    return {
+      ...item,
+      children: subChildren.length > 0 ? subChildren : undefined
+    };
+  });
+};
+
+// Public pack identifier is linkCode (not the private numeric id).
+const resolvePackId = async (param: string, transaction?: any): Promise<number | null> => {
+  if (/^[A-Za-z0-9]+$/.test(param)) {
+    const pack = await LevelPack.findOne({
+      where: { linkCode: param },
+      transaction
+    });
+
+    if (pack) {
+      return pack.id;
+    }
+  }
+
+  return null;
+};
+
+
+function packPublicIdSearchValue(value: string): string | null {
+  const raw = value.startsWith('#') ? value.slice(1) : value;
+  if (!/^[A-Za-z0-9]{1,32}$/.test(raw)) return null;
+  return raw;
+}
+
+function packNameWhere(value: string, exact: boolean, isNot: boolean) {
+  if (exact) {
+    return { name: isNot ? { [Op.ne]: value } : value };
+  }
+  return { name: isNot ? { [Op.notLike]: `%${value}%` } : { [Op.like]: `%${value}%` } };
+}
+
+function packLinkCodeWhere(code: string, exact: boolean, isNot: boolean) {
+  if (exact) {
+    return { linkCode: isNot ? { [Op.ne]: code } : code };
+  }
+  return { linkCode: isNot ? { [Op.notLike]: `%${code}%` } : { [Op.like]: `%${code}%` } };
+}
+
+// Helper function to gather pack IDs based on search criteria
+const gatherPackIdsFromSearch = async (searchGroups: SearchGroup[]): Promise<Set<number>> => {
+  if (searchGroups.length === 0) {
+    return new Set(); // No search criteria, return empty set
+  }
+
+  // Process each group (OR logic between groups)
+  const groupResults: Set<number>[] = [];
+
+  for (const group of searchGroups) {
+    const groupPackIdSets: Set<number>[] = [];
+
+    // Process each term within the group (AND logic within groups)
+    for (const term of group.terms) {
+      const { field, value, exact, isNot } = term;
+      let packIds: number[] = [];
+
+      if (field === 'id') {
+        const code = packPublicIdSearchValue(value);
+        if (code) {
+          const packs = await LevelPack.findAll({
+            where: packLinkCodeWhere(code, exact, isNot),
+            attributes: ['id']
+          });
+          packIds = packs.map(pack => pack.id);
+        }
+      } else if (field === 'any' || field === 'name') {
+        const nameWhere = packNameWhere(value, exact, isNot);
+        const code = field === 'any' ? packPublicIdSearchValue(value) : null;
+        let whereCondition: Record<string, unknown> = nameWhere;
+        if (code) {
+          const codeWhere = packLinkCodeWhere(code, exact, isNot);
+          whereCondition = isNot
+            ? { [Op.and]: [nameWhere, codeWhere] }
+            : { [Op.or]: [nameWhere, codeWhere] };
+        }
+
+        const packs = await LevelPack.findAll({
+          where: whereCondition,
+          attributes: ['id']
+        });
+        packIds = packs.map(pack => pack.id);
+      } else if (field === 'owner') {
+        // Owner username search
+        const whereCondition = exact
+          ? { username: isNot ? { [Op.ne]: value } : value }
+          : { username: isNot ? { [Op.notLike]: `%${value}%` } : { [Op.like]: `%${value}%` } };
+
+        const owners = await User.findAll({
+          where: whereCondition,
+          attributes: ['id']
+        });
+
+        if (owners.length > 0) {
+          const ownerIds = owners.map(owner => owner.id);
+          const packs = await LevelPack.findAll({
+            where: { ownerId: { [Op.in]: ownerIds } },
+            attributes: ['id']
+          });
+          packIds = packs.map(pack => pack.id);
+        }
+      } else if (field === 'levelid') {
+        // Level ID search - find packs containing this level
+        const levelId = parseInt(value);
+        if (!isNaN(levelId)) {
+          const whereCondition = {
+            type: 'level',
+            levelId: isNot ? { [Op.ne]: levelId } : levelId
+          };
+
+          const packItems = await LevelPackItem.findAll({
+            where: whereCondition,
+            attributes: ['packId']
+          });
+          packIds = packItems.map(item => item.packId);
+
+          // If NOT search, we need to find packs that don't contain this level
+          if (isNot) {
+            const allPacks = await LevelPack.findAll({
+              attributes: ['id']
+            });
+            const allPackIds = allPacks.map(pack => pack.id);
+            const containingPackIds = new Set(packIds);
+            packIds = allPackIds.filter(id => !containingPackIds.has(id));
+          }
+        }
+      } else if (field === 'viewmode') {
+        // View mode search
+        const viewMode = parseInt(value);
+        if (!isNaN(viewMode)) {
+          const whereCondition = { viewMode: isNot ? { [Op.ne]: viewMode } : viewMode };
+          const packs = await LevelPack.findAll({
+            where: whereCondition,
+            attributes: ['id']
+          });
+          packIds = packs.map(pack => pack.id);
+        }
+      } else if (field === 'pinned') {
+        // Pinned status search
+        const pinned = value.toLowerCase() === 'true';
+        const whereCondition = { isPinned: isNot ? !pinned : pinned };
+        const packs = await LevelPack.findAll({
+          where: whereCondition,
+          attributes: ['id']
+        });
+        packIds = packs.map(pack => pack.id);
+      }
+
+      // Always add the result set, even if empty (for proper AND logic)
+      groupPackIdSets.push(new Set(packIds));
+    }
+
+    // Combine terms within group using intersection (AND logic)
+    // If any term returns no results, the entire group should be empty
+    if (groupPackIdSets.length > 0) {
+      let groupResult = groupPackIdSets[0];
+      for (let i = 1; i < groupPackIdSets.length; i++) {
+        groupResult = new Set([...groupResult].filter(id => groupPackIdSets[i].has(id)));
+      }
+      groupResults.push(groupResult);
+    }
+  }
+
+  // Combine groups using union (OR logic)
+  if (groupResults.length === 0) {
+    return new Set();
+  }
+
+  let finalResult = groupResults[0];
+  for (let i = 1; i < groupResults.length; i++) {
+    finalResult = new Set([...finalResult, ...groupResults[i]]);
+  }
+
+  return finalResult;
+};
+
+// ==================== PACK OPERATIONS ====================
+
+const sortableFields = {
+  'RECENT': 'createdAt',
+  'NAME': 'name',
+  'FAVORITES': 'favoritesCount',
+  'LEVELS': 'levelCount'
+};
+// GET /packs - List all packs
+router.get(
+  '/',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getPacks',
+    summary: 'List packs',
+    description: 'List level packs with optional search, filters, and pagination. Query: page, offset, limit, query, viewMode, pinned, myLikesOnly, sort, order. Cached.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    query: { page: { schema: { type: 'string' } }, query: { schema: { type: 'string' } }, viewMode: { schema: { type: 'string' } }, pinned: { schema: { type: 'string' } }, myLikesOnly: { schema: { type: 'string' } }, offset: { schema: { type: 'string' } }, limit: { schema: { type: 'string' } }, sort: { schema: { type: 'string' } }, order: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Packs list' }, ...standardErrorResponses500 },
+  }),
+  Cache({
+  ttl: 300,
+  varyByUser: true,
+  varyByQuery: ['query', 'viewMode', 'pinned', 'myLikesOnly', 'offset', 'limit', 'sort', 'order'],
+  tags: ['packs:all'],
+  // levelId filters are used to decide "already in pack"; a cached miss stays wrong for the TTL.
+  skipIf: (req) => {
+    const query = typeof req.query.query === 'string' ? req.query.query : '';
+    return /(?:^|,|\s)levelid\s*[:=]/i.test(query);
+  },
+}),
+  async (req: Request, res: Response) => {
+  try {
+    let { page, offset, limit } = req.query as unknown as PaginationQuery;
+    const {
+      query,
+      viewMode,
+      pinned,
+      myLikesOnly,
+      sort = 'RECENT',
+      order: orderQuery = 'DESC'
+    } = req.query;
+
+    limit = Math.min(limit, MAX_LIMIT);
+
+    const whereConditions: any = {};
+
+    const sortField = sortableFields[sort as keyof typeof sortableFields] || 'createdAt';
+    const order = (orderQuery !== 'ASC' && orderQuery !== 'DESC') ? 'DESC' : orderQuery;
+
+    // Filter by view mode
+    if (viewMode !== undefined && hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+      const viewModeValue = parseInt(viewMode as string);
+      if (!isNaN(viewModeValue)) {
+        whereConditions.viewMode = viewModeValue;
+      }
+    }
+
+    const ownPacks = req.user ? await LevelPack.findAll({
+      where: { ownerId: req.user.id }
+    }) : [];
+    const ownPackIds = new Set(ownPacks.map(pack => pack.id));
+
+    // Filter by pinned
+    if (pinned !== undefined) {
+      whereConditions.isPinned = pinned === 'true';
+    }
+
+    // Step 1: Handle myLikesOnly filter - get user's favorited pack IDs
+    let favoritedPackIds: Set<number> | null = null;
+    if (myLikesOnly === 'true' && req.user?.id) {
+      const favorites = await PackFavorite.findAll({
+        where: { userId: req.user.id },
+        attributes: ['packId']
+      });
+      favoritedPackIds = new Set(favorites.map(fav => fav.packId));
+
+      if (favoritedPackIds.size === 0) {
+        // User has no favorites, return empty response
+        return res.json({
+          packs: [],
+          total: 0,
+          page,
+          offset,
+          limit
+        });
+      }
+    }
+
+    // Step 2: Gather pack IDs from search criteria
+    let searchPackIds: Set<number> | null = null;
+    if (query) {
+      const searchGroups = parseSearchQuery(query as string, queryParserConfigs.pack);
+      searchPackIds = await gatherPackIdsFromSearch(searchGroups);
+      // If search returned no results, return empty response
+      if (searchPackIds.size === 0) {
+        return res.json({
+          packs: [],
+          total: 0,
+          page,
+          offset,
+          limit
+        });
+      }
+    }
+
+    // Step 3: Combine filters - intersection of favorites and search results
+    if (favoritedPackIds && searchPackIds) {
+      // Intersection of both sets
+      searchPackIds = new Set([...searchPackIds].filter(id => favoritedPackIds!.has(id)));
+    } else if (favoritedPackIds) {
+      // Only favorites filter
+      searchPackIds = favoritedPackIds;
+    }
+
+    if (searchPackIds && searchPackIds.size > 0) {
+      whereConditions.id = { [Op.in]: Array.from(searchPackIds) };
+    }
+    // First, get all pack IDs with sorting applied (isPinned first, then requested sort)
+    const sortedPacks = await LevelPack.findAll({
+      where: whereConditions,
+      attributes: ['id', 'isPinned', sortField, 'viewMode'],
+      order: [
+        ['isPinned', 'DESC'], // Pinned packs first
+        [sortField, order] // Then by requested sort
+      ]
+    });
+    // Apply view mode filtering to get valid pack IDs
+    const viewModeFilter = (pack: LevelPack) : boolean => {
+      if (hasFlag(req.user, permissionFlags.SUPER_ADMIN)) return true;
+      if (ownPackIds.has(pack.id)) return true;
+      if (pack.viewMode === LevelPackViewModes.PUBLIC) return true;
+      return false;
+    };
+
+    const validPackIds = sortedPacks
+      .filter(viewModeFilter)
+      .map(pack => pack.id);
+
+    // Step 5: Apply pagination to the sorted ID list
+    const totalCount = validPackIds.length;
+    const paginatedPackIds = validPackIds.slice(offset, offset + limit);
+    // Step 6: Fetch full pack data for paginated IDs with same sorting
+    let packs: LevelPack[] = [];
+    if (paginatedPackIds.length > 0) {
+      packs = await LevelPack.findAll({
+        where: { id: { [Op.in]: paginatedPackIds } },
+        include: [{
+          model: User,
+          as: 'packOwner',
+          attributes: ['id', 'nickname', 'username', 'avatarUrl']
+        },
+        {
+          model: LevelPackItem,
+          attributes: ['levelId'],
+          as: 'packItems',
+          include: [{
+            model: Level,
+            where: {
+              isDeleted: false,
+              isHidden: false
+            },
+            as: 'referencedLevel',
+            attributes: ['id', 'artist', 'song', 'diffId'],
+            required: true,
+            include: [{
+              model: LevelCredit,
+              as: 'levelCredits',
+              required: false,
+              include: [{
+                model: Creator,
+                as: 'creator',
+                required: false
+              }],
+            },
+            {
+              model: Team,
+              as: 'teamObject'
+            }
+          ]
+          }],
+          required: false,
+        }],
+        order: [
+          ['isPinned', 'DESC'], // Maintain same sorting order
+          [sortField, order]
+        ]
+      });
+    }
+
+    // Get favorites for current user
+    const favoritedPacks = req.user ? await PackFavorite.findAll({
+      where: {
+        userId: req.user.id,
+        packId: { [Op.in]: paginatedPackIds }
+      }
+    }) : [];
+
+    return res.json({
+      packs: packs.map(pack => ({
+        ...pack.toJSON(),
+        id: pack.linkCode,
+        isFavorited: favoritedPacks.some(favorite => favorite.packId === pack.id),
+        packItems: pack.packItems?.filter(item => item.referencedLevel !== null).slice(0, 3),
+        totalLevelCount: pack.packItems?.length
+      })),
+      total: totalCount,
+      page,
+      offset,
+      limit
+    });
+
+  } catch (error) {
+    logger.error('Error fetching packs:', error);
+    return res.status(500).json({ error: 'Failed to fetch packs' });
+  }
+  }
+);
+
+// GET /packs/favorites - Get user's favorited packs
+// NOTE: This must be before GET /:id to avoid route collision
+router.get(
+  '/favorites',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'getPacksFavorites',
+    summary: 'User favorites',
+    description: 'Get current user\'s favorited packs.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    responses: { 200: { description: 'Favorited packs' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const packs = await LevelPack.findAll({
+      include: [
+        {
+          model: User,
+          as: 'packOwner',
+          attributes: ['id', 'nickname', 'username', 'avatarUrl']
+        },
+        {
+          model: PackFavorite,
+          as: 'favorites',
+          where: { userId: req.user!.id },
+          required: true
+        }
+      ],
+      order: [['name', 'ASC']],
+    }).then(packs => packs.map(pack => ({
+      ...pack,
+      id: pack.linkCode,
+    })));
+
+    return res.json({ packs });
+  } catch (error) {
+    logger.error('Error fetching favorited packs:', error);
+    return res.status(500).json({ error: 'Failed to fetch favorited packs' });
+  }
+  }
+);
+
+// GET /packs/:id/cdnData - CDN zip sizes/filenames for pack levels (detached from GET pack body)
+router.get(
+  '/:id/cdnData',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getPackCdnData',
+    summary: 'Get pack CDN metadata',
+    description:
+      'Per-level CDN zip size, original filename, and **trimmed** LEVELZIP metadata for third-party tooling: `targetLevelRelativePath`, `levelFiles` (array of name/relativePath/songFilename/size), `songFiles` (array of { name, size }). Cached separately from the pack tree.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    responses: { 200: { description: 'CDN metadata list' }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  Cache({
+    ttl: 60,
+    varyByUser: true,
+    tags: (req) => [`pack:${req.params.id}:cdn`]
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const param = req.params.id;
+    const resolvedPackId = await resolvePackId(param);
+    if (!resolvedPackId) {
+      return res.status(404).json({ error: 'Pack not found' });
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, {
+      include: [{
+        model: LevelPackItem,
+        as: 'packItems',
+        attributes: ['levelId', 'type'],
+        required: false
+      }]
+    });
+
+    if (!pack || !canViewPack(pack, req.user)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const levelIds = [...new Set(
+      (pack.packItems ?? [])
+        .filter(item => item.type === 'level' && item.levelId !== null)
+        .map(item => item.levelId!)
+    )];
+
+    if (levelIds.length === 0) {
+      return res.json({ items: [] });
+    }
+
+    const levels = await Level.findAll({
+      where: {
+        id: { [Op.in]: levelIds },
+        isDeleted: false,
+        isHidden: false
+      },
+      attributes: ['id', 'fileId']
+    });
+
+    const levelMetadataByFileId = new Map<string, {
+      fileId: string;
+      size?: number;
+      originalFilename?: string;
+      metadata: Record<string, unknown>;
+    }>();
+
+    for (let i = 0; i < levels.length; i += CDN_METADATA_BATCH_SIZE) {
+      const batch = levels.slice(i, i + CDN_METADATA_BATCH_SIZE);
+      try {
+        const batchMetadata = await cdnService.getBulkLevelMetadata(batch, {
+          timeoutMs: PACK_CDN_METADATA_BATCH_TIMEOUT_MS
+        });
+        for (const metadataResponse of batchMetadata) {
+          if (metadataResponse?.fileId && metadataResponse?.metadata) {
+            const m = metadataResponse.metadata as {
+              originalZip?: { size?: number; originalFilename?: string; name?: string };
+            };
+            levelMetadataByFileId.set(metadataResponse.fileId, {
+              fileId: metadataResponse.fileId,
+              size: m.originalZip?.size,
+              originalFilename: m.originalZip?.originalFilename || m.originalZip?.name,
+              metadata: metadataResponse.metadata as Record<string, unknown>
+            });
+          }
+        }
+      } catch (error) {
+        logger.warn('Pack cdnData batch failed, skipping batch', {
+          error: error instanceof Error ? error.message : String(error),
+          batchStart: i,
+          batchSize: batch.length,
+          packId: resolvedPackId
+        });
+      }
+    }
+
+    const items: Array<{
+      levelId: number;
+      fileId: string | null;
+      size: number | null;
+      originalFilename: string | null;
+      metadata: Record<string, unknown> | null;
+    }> = [];
+
+    for (const level of levels) {
+      const fid = level.fileId;
+      if (!fid) {
+        items.push({
+          levelId: level.id,
+          fileId: null,
+          size: null,
+          originalFilename: null,
+          metadata: null
+        });
+        continue;
+      }
+      const meta = levelMetadataByFileId.get(fid);
+      const prunedMeta = prunePackCdnMetadataForThirdParty(
+        meta?.metadata as Record<string, unknown> | undefined,
+      );
+      items.push({
+        levelId: level.id,
+        fileId: fid,
+        size: meta?.size ?? null,
+        originalFilename: meta?.originalFilename ?? null,
+        metadata: prunedMeta,
+      });
+    }
+
+    return res.json({ items });
+  } catch (error) {
+    logger.error('Error fetching pack CDN data:', error);
+    return res.status(500).json({ error: 'Failed to fetch pack CDN data' });
+  }
+  }
+);
+
+// GET /packs/:id - Get specific pack with its content tree
+router.get(
+  '/:id',
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getPack',
+    summary: 'Get pack',
+    description:
+      'Get a pack by ID or link code with optional tree. Uses stacked Redis layers (structure vs ES level payloads) inside the handler — not monolithic route Cache.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    query: { tree: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Pack details' }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const param = req.params.id;
+    const { tree = 'true' } = req.query;
+    const resolvedPackId = await resolvePackId(param);
+    if (!resolvedPackId) {
+      return res.status(404).json({ error: 'Pack not found' });
+    }
+    const pack = await LevelPack.findByPk(resolvedPackId, {
+      include: [{
+        model: User,
+        as: 'packOwner',
+        attributes: ['id', 'nickname', 'username', 'avatarUrl', 'creatorId', 'playerId']
+      }]
+    });
+
+    if (!canViewPack(pack!, req.user)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const linkCode = pack!.linkCode ?? null;
+
+    const [clearSets, { flatItemsMerged: mergedFlat }] = await Promise.all([
+      req.user
+        ? Pass.findAll({
+            where: { playerId: req.user.playerId, isDeleted: false },
+            attributes: ['levelId', 'accuracy'],
+          }).then((passes) => {
+            const cleared = new Set<number>();
+            const purePerfect = new Set<number>();
+            for (const pass of passes) {
+              if (pass.levelId == null) continue;
+              cleared.add(pass.levelId);
+              if (Number(pass.accuracy) >= 1 - 1e-9) {
+                purePerfect.add(pass.levelId);
+              }
+            }
+            return { cleared, purePerfect };
+          })
+        : Promise.resolve({
+            cleared: new Set<number>(),
+            purePerfect: new Set<number>(),
+          }),
+      resolvePackItemsWithStackedCache(resolvedPackId, linkCode, []),
+    ]);
+
+    const itemsWithClears = mergedFlat.map((item: any) => ({
+      ...item,
+      isCleared: clearSets.cleared.has(item.levelId || 0),
+      isPurePerfect: clearSets.purePerfect.has(item.levelId || 0),
+    }));
+
+    const items = await annotateReferencedLevelsWithLikeState(
+      itemsWithClears,
+      req.user?.id,
+    );
+
+    const packData: any = pack!.toJSON();
+    delete packData.packItems;
+    if (packData.packOwner && typeof packData.packOwner === 'object') {
+      const po = packData.packOwner as Record<string, unknown>;
+      packData.packOwner = {
+        nickname: po.nickname ?? null,
+        username: po.username ?? null,
+        avatarUrl: po.avatarUrl ?? null,
+        creatorId: po.creatorId ?? null,
+        playerId: po.playerId ?? null,
+      };
+    }
+
+    if (tree === 'true') {
+      packData.items = buildItemTree(items);
+    } else {
+      packData.items = items;
+    }
+
+    return res.json({
+      ...packData,
+      id: packData.linkCode,
+    });
+
+  } catch (error) {
+    logger.error('Error fetching pack:', error);
+    return res.status(500).json({ error: 'Failed to fetch pack' });
+  }
+  }
+);
+
+router.post(
+  '/:id/download-link',
+  Auth.verified(),
+  ApiDoc({
+    operationId: 'postPackDownloadLink',
+    summary: 'Generate download link',
+    description: 'Generate a CDN download link (zip) for a pack or folder.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'folderId, downloadId, trimFolderNames (optional)', schema: { type: 'object', properties: { folderId: { type: 'integer' }, downloadId: { type: 'string' }, trimFolderNames: { type: 'boolean' } } }, required: false },
+    responses: { 200: { description: 'Download link payload' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const param = req.params.id;
+    const { folderId, downloadId, trimFolderNames } = req.body ?? {};
+
+    const resolvedPackId = await resolvePackId(param);
+    if (!resolvedPackId) {
+      return res.status(404).json({ error: 'Pack not found' });
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, {
+      include: [{
+        model: User,
+        as: 'packOwner',
+        attributes: ['id']
+      }]
+    });
+
+    if (!pack) {
+      return res.status(404).json({ error: 'Pack not found' });
+    }
+
+    if (!canViewPack(pack, req.user)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const packItems = await LevelPackItem.findAll({
+      where: { packId: pack.id },
+      include: [{
+        model: Level,
+        as: 'referencedLevel',
+        required: false
+      }],
+      order: [['sortOrder', 'ASC']]
+    });
+
+    const targetFolderId = folderId !== undefined ? Number(folderId) : null;
+    let targetFolder: LevelPackItem | null = null;
+    if (targetFolderId !== null) {
+      targetFolder = packItems.find(item => item.id === targetFolderId && item.type === 'folder') || null;
+      if (!targetFolder) {
+        return res.status(404).json({ error: 'Folder not found in pack' });
+      }
+    }
+
+    const itemsByParent = new Map<number, LevelPackItem[]>();
+    for (const item of packItems) {
+      const parentKey = item.parentId ?? 0;
+      if (!itemsByParent.has(parentKey)) {
+        itemsByParent.set(parentKey, []);
+      }
+      itemsByParent.get(parentKey)!.push(item);
+    }
+
+    // Ensure deterministic ordering by sortOrder then id
+    itemsByParent.forEach(children => {
+      children.sort((a, b) => {
+        const sortA = a.sortOrder ?? 0;
+        const sortB = b.sortOrder ?? 0;
+        if (sortA !== sortB) return sortA - sortB;
+        return (a.id ?? 0) - (b.id ?? 0);
+      });
+    });
+
+    type DownloadTreeNode = {
+      type: 'folder' | 'level';
+      name: string;
+      children?: DownloadTreeNode[];
+      fileId?: string | null;
+      sourceUrl?: string | null;
+      levelId?: number | null;
+      packItemId?: number;
+    };
+
+    const buildDownloadTree = (parentId = 0): DownloadTreeNode[] => {
+      const children = itemsByParent.get(parentId) ?? [];
+
+      return children.map(child => {
+        if (child.type === 'folder') {
+          return {
+            type: 'folder',
+            name: child.name || `Folder ${child.id}`,
+            children: buildDownloadTree(child.id),
+            packItemId: child.id
+          };
+        }
+
+        const level: any = child.referencedLevel;
+        if (!level) {
+          return null;
+        }
+
+        const cdnFileId =
+          level.fileId ?? getFileIdFromCdnUrl(level.dlLink ?? '') ?? null;
+        const songNamePart = getSongDisplayName(level);
+        const displayName = `#${level.id} ${songNamePart}`;
+
+        return {
+          type: 'level',
+          name: displayName,
+          fileId: cdnFileId,
+          sourceUrl: cdnFileId ? null : (level.dlLink || null),
+          levelId: level.id ?? null,
+          packItemId: child.id
+        };
+      }).filter((node) => node !== null) as DownloadTreeNode[];
+    };
+
+    const rootChildren = buildDownloadTree(targetFolder ? targetFolder.id : 0);
+
+    if (rootChildren.length === 0) {
+      return res.status(400).json({ error: 'No levels available for download in the selected scope' });
+    }
+
+    const folderOrPackName = targetFolder ? targetFolder.name : pack.name;
+    const packCode = pack.linkCode;
+    const zipDisplayName = packCode
+      ? `${folderOrPackName} - ${packCode}`
+      : folderOrPackName;
+
+    const treePayload = {
+      type: 'folder',
+      name: zipDisplayName,
+      children: rootChildren
+    };
+
+    const cacheKey = createHash('sha256').update(JSON.stringify({
+      ...treePayload,
+      trimFolderNames: trimFolderNames !== false
+    })).digest('hex');
+
+    const jobId =
+      typeof downloadId === 'string' && downloadId.length > 0 ? downloadId : randomUUID();
+
+    await jobProgressService.patchTrusted(jobId, {
+      ownerUserId: req.user!.id,
+      kind: 'pack_download',
+      phase: 'pending',
+      percent: 0,
+      message: 'Starting pack download',
+      meta: {
+        cacheKey,
+        packId: pack.id,
+        folderId: targetFolder ? targetFolder.id : null
+      }
+    });
+
+    // Pre-increment downloadCount for every CDN-backed level in the pack tree.
+    // Pack downloads are bulk operations and the CDN does not emit per-level
+    // download events for them, so we account for the downloads up-front
+    // (with cache invalidation) before asking the CDN to zip anything.
+    const packFileIds: string[] = [];
+    const collectPackFileIds = (nodes: DownloadTreeNode[]): void => {
+      for (const node of nodes) {
+        if (node.type === 'folder') {
+          if (Array.isArray(node.children)) collectPackFileIds(node.children);
+          continue;
+        }
+        if (typeof node.fileId === 'string' && node.fileId.length > 0) {
+          packFileIds.push(node.fileId);
+        }
+      }
+    };
+    collectPackFileIds(rootChildren);
+
+    try {
+      const updated = await incrementLevelDownloadCountsForFileIds(packFileIds);
+      logger.debug('Pre-incremented downloadCount for pack download', {
+        packId: pack.id,
+        folderId: targetFolder ? targetFolder.id : null,
+        fileIdCount: packFileIds.length,
+        updatedLevels: updated,
+      });
+    } catch (error) {
+      logger.warn('Failed to pre-increment downloadCount for pack download', {
+        packId: pack.id,
+        folderId: targetFolder ? targetFolder.id : null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const cdnResponse = await cdnService.generatePackDownload({
+      zipName: zipDisplayName || 'Missing pack name',
+      packId: pack.id,
+      packCode: packCode,
+      folderId: targetFolder ? targetFolder.id : null,
+      cacheKey,
+      tree: treePayload,
+      downloadId: jobId,
+      trimFolderNames: trimFolderNames !== false
+    });
+
+    // CDN responds with 202 immediately (request received); preflight, cache, and zip build
+    // run in the background. The client monitors /v2/jobs/:downloadId/stream for completion.
+    return res.json({
+      ...cdnResponse,
+      downloadId: jobId,
+    });
+  } catch (error) {
+    if (error instanceof CdnError) {
+      return respondWithCdnError(res, error);
+    }
+    logger.error('Error generating pack download link:', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      packParam: req.params.id
+    });
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to generate download link',
+    });
+  }
+  }
+);
+
+// POST /packs - Create new pack
+router.post(
+  '/',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'postPack',
+    summary: 'Create pack',
+    description: 'Create a new level pack. Name required; description, viewMode, iconUrl, cssFlags, isPinned optional.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'name, description, iconUrl, cssFlags, viewMode, isPinned', schema: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string', maxLength: 2000 }, iconUrl: { type: 'string' }, cssFlags: { type: 'integer' }, viewMode: { type: 'integer' }, isPinned: { type: 'boolean' } }, required: ['name'] }, required: true },
+    responses: { 201: { description: 'Pack created' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const { name, description, iconUrl, cssFlags, viewMode, isPinned } = req.body;
+    if (viewMode === LevelPackViewModes.FORCED_PRIVATE) {
+      throw { error: 'Forced private packs are not allowed to be created', code: 400 };
+    }
+
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      throw { error: 'Pack name is required', code: 400 };
+    }
+
+    const queriedUser = await User.findOne({
+      where: { username: req.user!.username },
+      transaction
+    });
+
+    // Check pack limit for user
+    const userPackCount = await LevelPack.count({
+      where: { ownerId: queriedUser!.id },
+      transaction
+    });
+
+    const packQuota = await resolvePackQuotaForUser(req.user!);
+    if (userPackCount >= packQuota.maxPacks) {
+      throw { error: `Maximum ${packQuota.maxPacks} packs allowed per user`, code: 400 };
+    }
+
+    // Only allow admins to create public packs or set pin status
+    let finalViewMode;
+    let finalIsPinned = false;
+
+    if (hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+      // Admins can set any view mode, default to public
+      finalViewMode = viewMode || LevelPackViewModes.PUBLIC;
+      finalIsPinned = isPinned || false;
+    } else {
+      // Non-admins can only create private or link-only packs, never public
+      if (viewMode === LevelPackViewModes.PUBLIC) {
+        throw { error: 'Only administrators can create public packs', code: 403 };
+      }
+      finalViewMode = viewMode || LevelPackViewModes.PRIVATE;
+      // Non-admins cannot set pin status
+      if (isPinned) {
+        throw { error: 'Only administrators can set pack pin status', code: 403 };
+      }
+    }
+
+    // Generate unique linkCode
+    const generateLinkCode = () => {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      let result = '';
+      for (let i = 0; i < 8; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    };
+
+    let linkCode = generateLinkCode();
+    let attempts = 0;
+    const maxAttempts = 50;
+
+    // Ensure uniqueness
+    while (attempts < maxAttempts) {
+      const existingPack = await LevelPack.findOne({
+        where: { linkCode },
+        transaction
+      });
+
+      if (!existingPack) {
+        break;
+      }
+
+      linkCode = generateLinkCode();
+      attempts++;
+    }
+
+    // If we still couldn't find a unique code, increase length
+    if (attempts >= maxAttempts) {
+      const extendedChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      let extendedCode = '';
+      for (let i = 0; i < 9; i++) {
+        extendedCode += extendedChars.charAt(Math.floor(Math.random() * extendedChars.length));
+      }
+      linkCode = extendedCode;
+    }
+
+    const normalizedDescription = description !== undefined
+      ? normalizePackDescription(description)
+      : null;
+
+    const pack = await LevelPack.create({
+      ownerId: queriedUser!.id,
+      name: name.trim(),
+      description: normalizedDescription,
+      iconUrl: iconUrl || null,
+      cssFlags: cssFlags || 0,
+      viewMode: finalViewMode,
+      isPinned: finalIsPinned,
+      linkCode
+    }, { transaction });
+
+    await transaction.commit();
+
+    const packJson = pack.toJSON();
+    return res.status(201).json({
+      ...packJson,
+      id: pack.linkCode,
+    });
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error creating pack:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error creating pack:', error);
+    return res.status(500).json({ error: 'Failed to create pack' });
+  }
+  }
+);
+
+// PUT /packs/:id - Update pack
+router.put(
+  '/:id',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putPack',
+    summary: 'Update pack',
+    description: 'Update pack name, description, viewMode, cssFlags, isPinned (admin for some fields).',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'name, description, cssFlags, viewMode, isPinned', schema: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string', maxLength: 2000 }, cssFlags: { type: 'integer' }, viewMode: { type: 'integer' }, isPinned: { type: 'boolean' } } }, required: true },
+    responses: { 200: { description: 'Pack updated' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    const { name, description, cssFlags, viewMode, isPinned } = req.body;
+    const updateData: any = {};
+
+    if (viewMode === LevelPackViewModes.FORCED_PRIVATE && !hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+      throw { error: 'Only administrators can force private packs', code: 403 };
+    }
+
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        throw { error: 'Pack name cannot be empty', code: 400 };
+      }
+      updateData.name = name.trim();
+    }
+
+    if (description !== undefined) {
+      updateData.description = normalizePackDescription(description);
+    }
+
+    if (cssFlags !== undefined) updateData.cssFlags = cssFlags;
+
+    // Only allow admins to modify pin status
+    if (isPinned !== undefined && hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+      updateData.isPinned = isPinned;
+    }
+
+    // Only restrict viewMode changes when involving public visibility
+    if (viewMode !== undefined) {
+      const isChangingToOrFromPublic =
+        viewMode === LevelPackViewModes.PUBLIC ||
+        pack.viewMode === LevelPackViewModes.PUBLIC;
+
+      if (isChangingToOrFromPublic && !hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+        throw { error: 'Only administrators can modify pack visibility to/from public', code: 403 };
+      }
+
+      // Additional check for forced private packs
+      if (pack.viewMode === LevelPackViewModes.FORCED_PRIVATE && !hasFlag(req.user, permissionFlags.SUPER_ADMIN)) {
+        throw { error: 'Cannot modify view mode of admin-locked pack', code: 403 };
+      }
+
+      updateData.viewMode = viewMode;
+    }
+
+    await pack.update(updateData, { transaction });
+    await transaction.commit();
+
+    return res.json({
+      ...pack.dataValues,
+      id: pack.linkCode,
+    });
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error updating pack:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error updating pack:', error);
+    return res.status(500).json({ error: 'Failed to update pack' });
+  }
+  }
+);
+
+// DELETE /packs/:id - Delete pack
+router.delete(
+  '/:id',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'deletePack',
+    summary: 'Delete pack',
+    description: 'Delete a pack. Owner or admin.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    responses: { 200: { description: 'Pack deleted' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    await pack.destroy({ transaction });
+    await transaction.commit();
+
+    return res.status(204).end();
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error deleting pack:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error deleting pack:', error);
+    return res.status(500).json({ error: 'Failed to delete pack' });
+  }
+  }
+);
+
+// POST /packs/:id/icon - Upload pack icon
+router.post(
+  '/:id/icon',
+  Auth.user(),
+  upload.single('icon'),
+  ApiDoc({
+    operationId: 'postPackIcon',
+    summary: 'Upload pack icon',
+    description: 'Upload pack icon (JPEG/PNG/WebP, max 5MB).',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'multipart/form-data with icon file (JPEG/PNG/WebP, max 5MB)', schema: { type: 'object', properties: { icon: { type: 'string', format: 'binary' } } }, required: true },
+    responses: { 200: { description: 'Icon uploaded' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+        const resolvedPackId = await resolvePackId(req.params.id);
+        if (!resolvedPackId) {
+            return res.status(400).json({ error: 'Invalid pack ID or link code' });
+        }
+
+        const pack = await LevelPack.findByPk(resolvedPackId);
+        if (!pack) {
+            return res.status(404).json({ error: 'Pack not found' });
+        }
+
+        if (!canEditPack(pack, req.user)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        if (!req.file) {
+            return res.status(400).json({
+                error: 'No file uploaded',
+                code: 'NO_FILE'
+            });
+        }
+
+        const result = await cdnService.uploadPackIcon(
+            req.file.buffer,
+            req.file.originalname
+        );
+
+        // Delete old icon if it exists
+        try {
+            if (pack.iconUrl && isCdnUrl(pack.iconUrl)) {
+                const oldFileId = getFileIdFromCdnUrl(pack.iconUrl);
+                if (oldFileId && await cdnService.checkFileExists(oldFileId)) {
+                    await cdnService.deleteFile(oldFileId);
+                }
+            }
+        } catch (error) {
+            logger.error('Error deleting old pack icon from CDN:', error);
+        }
+
+        await pack.update({
+            iconUrl: result.urls.original
+        });
+
+        return res.json({
+            message: 'Pack icon uploaded successfully',
+            icon: {
+                id: result.fileId,
+                urls: result.urls,
+            }
+        });
+    } catch (error) {
+        logger.error('Error uploading pack icon:', error);
+
+        if (error instanceof CdnError) {
+            return respondWithCdnError(res, error);
+        }
+
+        return res.status(500).json({
+            error: error instanceof Error ? error.message : 'Failed to upload pack icon',
+            code: 'SERVER_ERROR',
+        });
+    }
+  }
+);
+
+// DELETE /packs/:id/icon - Remove pack icon
+router.delete(
+  '/:id/icon',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'deletePackIcon',
+    summary: 'Remove pack icon',
+    description: 'Remove pack icon from CDN.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    responses: { 200: { description: 'Icon removed' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+        const resolvedPackId = await resolvePackId(req.params.id);
+        if (!resolvedPackId) {
+            return res.status(400).json({ error: 'Invalid pack ID or link code' });
+        }
+
+        const pack = await LevelPack.findByPk(resolvedPackId);
+        if (!pack) {
+            return res.status(404).json({ error: 'Pack not found' });
+        }
+
+        if (!canEditPack(pack, req.user)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        if (!pack.iconUrl || !isCdnUrl(pack.iconUrl)) {
+            return res.status(400).json({ error: 'No icon to remove' });
+        }
+
+        const oldFileId = getFileIdFromCdnUrl(pack.iconUrl);
+
+        await pack.update({
+            iconUrl: null
+        });
+
+        try {
+            if (oldFileId) {
+                await cdnService.deleteFile(oldFileId);
+            }
+        } catch (error) {
+            logger.error('Error deleting old pack icon from CDN:', error);
+        }
+
+        return res.json({ message: 'Pack icon removed successfully' });
+    } catch (error) {
+        logger.error('Error removing pack icon:', error);
+        return res.status(500).json({ error: 'Failed to remove pack icon' });
+    }
+  }
+);
+
+// ==================== PACK ITEM OPERATIONS ====================
+
+type LevelInsertInvalidReason = 'not_found' | 'already_in_pack' | 'quota_exceeded';
+
+interface LevelInsertInvalidEntry {
+  levelId: number;
+  reason: LevelInsertInvalidReason;
+}
+
+function parsePackLevelIds(levelIds: unknown): number[] {
+  let parsed: number[] = [];
+
+  if (typeof levelIds === 'number') {
+    parsed = [levelIds];
+  } else if (Array.isArray(levelIds) && levelIds.every((id) => typeof id === 'number')) {
+    parsed = levelIds;
+  } else if (levelIds && typeof levelIds === 'string') {
+    const numberMatches = levelIds.match(/\d+/g);
+    if (numberMatches) {
+      parsed = numberMatches.map((match) => parseInt(match, 10)).filter((id) => !isNaN(id));
+    }
+  }
+
+  const seen = new Set<number>();
+  const result: number[] = [];
+  for (const id of parsed) {
+    if (id > 0 && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result;
+}
+
+async function resolveLevelInsertCandidates(
+  resolvedPackId: number,
+  levelIds: unknown,
+  parentId: number | undefined | null,
+  maxItems: number,
+  transaction: any,
+): Promise<{
+  validLevelIds: number[];
+  invalid: LevelInsertInvalidEntry[];
+  quota: { currentCount: number; maxAllowed: number };
+}> {
+  const levelIdsToAdd = parsePackLevelIds(levelIds);
+  const targetParentId = parentId || 0;
+
+  if (parentId) {
+    const parent = await LevelPackItem.findOne({
+      where: { id: parentId, packId: resolvedPackId, type: 'folder' },
+      transaction,
+    });
+
+    if (!parent) {
+      throw { error: 'Invalid parent folder', code: 400 };
+    }
+  }
+
+  const currentItemCount = await LevelPackItem.count({
+    where: { packId: resolvedPackId },
+    transaction,
+  });
+
+  const remainingSlots = Math.max(0, maxItems - currentItemCount);
+
+  const levels =
+    levelIdsToAdd.length > 0
+      ? await Level.findAll({
+          where: { id: { [Op.in]: levelIdsToAdd } },
+          attributes: ['id'],
+          transaction,
+        })
+      : [];
+  const foundLevelIds = new Set(levels.map((level) => level.id));
+
+  const existingItems =
+    levelIdsToAdd.length > 0
+      ? await LevelPackItem.findAll({
+          where: {
+            packId: resolvedPackId,
+            type: 'level',
+            parentId: targetParentId,
+            levelId: { [Op.in]: levelIdsToAdd },
+          },
+          attributes: ['levelId'],
+          transaction,
+        })
+      : [];
+  const existingLevelIdsInParent = new Set(existingItems.map((item) => item.levelId));
+
+  const validLevelIds: number[] = [];
+  const invalid: LevelInsertInvalidEntry[] = [];
+  let slotsUsed = 0;
+
+  for (const levelId of levelIdsToAdd) {
+    if (!foundLevelIds.has(levelId)) {
+      invalid.push({ levelId, reason: 'not_found' });
+      continue;
+    }
+    if (existingLevelIdsInParent.has(levelId)) {
+      invalid.push({ levelId, reason: 'already_in_pack' });
+      continue;
+    }
+    if (slotsUsed >= remainingSlots) {
+      invalid.push({ levelId, reason: 'quota_exceeded' });
+      continue;
+    }
+    validLevelIds.push(levelId);
+    slotsUsed += 1;
+  }
+
+  return {
+    validLevelIds,
+    invalid,
+    quota: { currentCount: currentItemCount, maxAllowed: maxItems },
+  };
+}
+
+// POST /packs/:id/items/validate-levels - Validate level IDs before insert
+router.post(
+  '/:id/items/validate-levels',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'postPackItemsValidateLevels',
+    summary: 'Validate pack level insert',
+    description: 'Check which level IDs can be added to a pack at a given parent. Returns valid and invalid IDs with reasons.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: {
+      description: 'levelIds, parentId',
+      schema: { type: 'object' },
+      required: true,
+    },
+    responses: {
+      200: { description: 'Validation result' },
+      400: { schema: errorResponseSchema },
+      403: { schema: errorResponseSchema },
+      ...standardErrorResponses404500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+
+    try {
+      transaction = await sequelize.transaction();
+      const resolvedPackId = await resolvePackId(req.params.id, transaction);
+      if (!resolvedPackId) {
+        throw { error: 'Invalid pack ID or link code', code: 400 };
+      }
+
+      const { levelIds, parentId } = req.body;
+
+      const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+      if (!pack) {
+        throw { error: 'Pack not found', code: 404 };
+      }
+
+      if (!canEditPack(pack, req.user)) {
+        throw { error: 'Access denied', code: 403 };
+      }
+
+      if (parsePackLevelIds(levelIds).length === 0) {
+        throw { error: 'Valid level ID(s) are required', code: 400 };
+      }
+
+      const packQuota = await resolvePackQuotaForUser(req.user!);
+      const result = await resolveLevelInsertCandidates(
+        resolvedPackId,
+        levelIds,
+        parentId,
+        packQuota.maxItems,
+        transaction,
+      );
+
+      await transaction.commit();
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      await safeTransactionRollback(transaction);
+      if (error.code) {
+        if (error.code === 500) logger.error('Error validating pack level insert:', error);
+        return res.status(error.code).json(error);
+      }
+      logger.error('Error validating pack level insert:', error);
+      return res.status(500).json({ error: 'Failed to validate level insert' });
+    }
+  },
+);
+
+// POST /packs/:id/items - Add item (folder or level) to pack
+router.post(
+  '/:id/items',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'postPackItems',
+    summary: 'Add pack items',
+    description: 'Add folder(s) or level(s) to a pack. type, name/levelIds, parentId, sortOrder.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'type, name (folder), levelIds (level), parentId, sortOrder', schema: { type: 'object' }, required: true },
+    responses: { 200: { description: 'Items added' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const { type, name, levelIds, parentId, sortOrder } = req.body;
+
+    if (!type || (type !== 'folder' && type !== 'level')) {
+      throw { error: 'Type must be "folder" or "level"', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    const packQuota = await resolvePackQuotaForUser(req.user!);
+
+    // Validate based on type
+    if (type === 'folder') {
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        throw { error: 'Folder name is required', code: 400 };
+      }
+
+      // Check for duplicate folder name in same parent
+      const existingFolder = await LevelPackItem.findOne({
+        where: {
+          packId: resolvedPackId,
+          type: 'folder',
+          parentId: parentId || 0,
+          name: name.trim()
+        },
+        transaction
+      });
+
+      if (existingFolder) {
+        throw { error: 'Folder with this name already exists in this location', code: 400 };
+      }
+
+      // Validate parent if provided
+      if (parentId) {
+        const parent = await LevelPackItem.findOne({
+          where: { id: parentId, packId: resolvedPackId, type: 'folder' },
+          transaction
+        });
+
+        if (!parent) {
+          throw { error: 'Invalid parent folder', code: 400 };
+        }
+      }
+
+      // Check item limit
+      const itemCount = await LevelPackItem.count({
+        where: { packId: resolvedPackId },
+        transaction
+      });
+
+      if (itemCount >= packQuota.maxItems) {
+        throw { error: `Maximum ${packQuota.maxItems} items allowed per pack`, code: 400 };
+      }
+
+      // Determine sort order
+      let finalSortOrder = sortOrder;
+      if (finalSortOrder === undefined || finalSortOrder === null) {
+        const maxSortOrder = await LevelPackItem.max('sortOrder', {
+          where: { packId: resolvedPackId, parentId: parentId || 0 },
+          transaction
+        });
+        finalSortOrder = (maxSortOrder as number || 0) + 1;
+      }
+
+      const item = await LevelPackItem.create({
+        packId: resolvedPackId,
+        type: 'folder',
+        parentId: parentId || 0,
+        name: name.trim(),
+        levelId: null,
+        sortOrder: finalSortOrder
+      }, { transaction });
+
+      await transaction.commit();
+
+      return res.status(201).json(item);
+    } else {
+      // type === 'level'
+      if (parsePackLevelIds(levelIds).length === 0) {
+        throw { error: 'Valid level ID(s) are required', code: 400 };
+      }
+
+      const { validLevelIds: newLevelIds, invalid } = await resolveLevelInsertCandidates(
+        resolvedPackId,
+        levelIds,
+        parentId,
+        packQuota.maxItems,
+        transaction,
+      );
+
+      if (newLevelIds.length === 0) {
+        throw {
+          error: 'No levels can be added',
+          code: 400,
+          details: { invalid },
+        };
+      }
+
+      // Add all new levels
+      let baseSortOrder = sortOrder;
+      if (baseSortOrder === undefined || baseSortOrder === null) {
+        const maxSortOrder = await LevelPackItem.max('sortOrder', {
+          where: { packId: resolvedPackId, parentId: parentId || 0 },
+          transaction
+        });
+        baseSortOrder = (maxSortOrder as number || 0) + 1;
+      }
+
+      const itemsToCreate = newLevelIds.map((levelIdToAdd, i) => ({
+        packId: resolvedPackId,
+        type: 'level' as const,
+        parentId: parentId || 0,
+        name: null,
+        levelId: levelIdToAdd,
+        sortOrder: baseSortOrder + i
+      }));
+
+      // Use ignoreDuplicates to handle race conditions from concurrent requests
+      // This prevents errors when the same level is added by parallel requests
+      const createdItems = await LevelPackItem.bulkCreate(itemsToCreate, {
+        transaction,
+        ignoreDuplicates: true
+      });
+
+      await transaction.commit();
+
+      // If all items were duplicates (concurrent request already added them), return success with empty array
+      if (createdItems.length === 0) {
+        return res.status(200).json({ message: 'Levels already in pack', items: [] });
+      }
+
+      const createdRows = await LevelPackItem.findAll({
+        where: {
+          id: { [Op.in]: createdItems.map(item => item.id) }
+        },
+        attributes: ['id', 'type', 'parentId', 'sortOrder', 'name', 'levelId', 'packId'],
+        order: [['sortOrder', 'ASC']],
+      });
+
+      const result = await hydratePackItemRowsWithReferencedLevels(createdRows);
+
+      return res.status(201).json(result);
+    }
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error adding item to pack:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error adding item to pack:', error);
+    return res.status(500).json({ error: 'Failed to add item to pack' });
+  }
+  }
+);
+
+// PUT /packs/:id/items/:itemId - Update item
+router.put(
+  '/:id/items/:itemId',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putPackItem',
+    summary: 'Update pack item',
+    description: 'Update pack item (e.g. folder name).',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, itemId: { schema: { type: 'string' } } },
+    requestBody: { description: 'name (for folders)', schema: { type: 'object', properties: { name: { type: 'string' } } }, required: true },
+    responses: { 200: { description: 'Item updated' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const itemId = parseInt(req.params.itemId);
+
+    if (isNaN(itemId)) {
+      throw { error: 'Invalid item ID', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    const item = await LevelPackItem.findOne({
+      where: { id: itemId, packId: resolvedPackId },
+      transaction
+    });
+
+    if (!item) {
+      throw { error: 'Item not found in pack', code: 404 };
+    }
+
+    const { name } = req.body;
+
+    if (item.type === 'folder' && name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        throw { error: 'Folder name cannot be empty', code: 400 };
+      }
+
+      // Check for duplicate folder name in same parent
+      const existingFolder = await LevelPackItem.findOne({
+        where: {
+          packId: resolvedPackId,
+          type: 'folder',
+          parentId: item.parentId,
+          name: name.trim(),
+          id: { [Op.ne]: itemId }
+        },
+        transaction
+      });
+
+      if (existingFolder) {
+        throw { error: 'Folder with this name already exists in this location', code: 400 };
+      }
+
+      await item.update({ name: name.trim() }, { transaction });
+    }
+
+    await transaction.commit();
+
+    return res.json(item);
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error updating pack item:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error updating pack item:', error);
+    return res.status(500).json({ error: 'Failed to update pack item' });
+  }
+  }
+);
+
+// PUT /packs/:id/tree - Update entire pack tree structure
+router.put(
+  '/:id/tree',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putPackTree',
+    summary: 'Update pack tree',
+    description: 'Update full pack tree (items array with id, parentId, sortOrder, children).',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'items: nested tree', schema: { type: 'object', properties: { items: { type: 'array', items: { type: 'object' } } }, required: ['items'] }, required: true },
+    responses: { 200: { description: 'Tree updated' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const { items } = req.body;
+
+    if (!Array.isArray(items)) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({ error: 'items must be an array' });
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({ error: 'Pack not found' });
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      await safeTransactionRollback(transaction);
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Flatten the tree structure to get all updates
+    const flattenTreeUpdates = (treeItems: any[], parentId = 0, updates: any[] = []) => {
+      treeItems.forEach((item, index) => {
+        updates.push({
+          id: item.id,
+          parentId: parentId,
+          sortOrder: index
+        });
+
+        if (item.children && Array.isArray(item.children)) {
+          flattenTreeUpdates(item.children, item.id, updates);
+        }
+      });
+      return updates;
+    };
+
+    const updates = flattenTreeUpdates(items);
+
+    // Validate all items belong to this pack
+    const itemIds = updates.map(u => u.id);
+    const packItems = await LevelPackItem.findAll({
+      where: {
+        packId: resolvedPackId,
+        id: { [Op.in]: itemIds }
+      },
+      transaction
+    });
+
+    if (packItems.length !== itemIds.length) {
+      throw { error: 'Some items do not belong to this pack', code: 400 };
+    }
+
+    // Check for circular references in folders
+    const folderMap = new Map<number, number>();
+    updates.forEach(update => {
+      folderMap.set(update.id, update.parentId ?? 0);
+    });
+
+    for (const item of packItems) {
+      if (item.type === 'folder') {
+        let currentParentId = folderMap.get(item.id);
+        const visited = new Set<number>([item.id]);
+
+        while (currentParentId && currentParentId !== 0) {
+          if (visited.has(currentParentId)) {
+            throw { error: 'Circular reference detected in folder structure', code: 400 };
+          }
+          visited.add(currentParentId);
+          currentParentId = folderMap.get(currentParentId);
+        }
+      }
+    }
+
+    // Enrich updates with item data from packItems for efficient access
+    const itemMap = new Map(packItems.map(item => [item.id, item]));
+    const enrichedUpdates = updates.map(update => ({
+      ...update,
+      item: itemMap.get(update.id)!
+    }));
+
+    // Check for unique constraint violations before updating
+    // The constraint is on (packId, parentId, name) for folders
+    // For levels, check (packId, parentId, levelId) to prevent duplicates in same location
+    for (const update of enrichedUpdates) {
+      if (update.item?.type === 'folder' && update.item?.name) {
+        // Check if moving this folder to the new parent would create a duplicate name
+        const existingFolder = await LevelPackItem.findOne({
+          where: {
+            packId: resolvedPackId,
+            type: 'folder',
+            parentId: update.parentId,
+            name: update.item.name,
+            id: { [Op.ne]: update.id } // Exclude the current item
+          },
+          transaction
+        });
+
+        if (existingFolder) {
+          throw {
+            error: `Folder "${update.item.name}" already exists in the target location`,
+            code: 400,
+            details: {
+              folderId: update.id,
+              folderName: update.item.name,
+              targetParentId: update.parentId
+            }
+          };
+        }
+      } else if (update.item?.type === 'level' && update.item?.levelId) {
+        // Check if moving this level to the new parent would create a duplicate levelId in same location
+        const existingLevel = await LevelPackItem.findOne({
+          where: {
+            packId: resolvedPackId,
+            type: 'level',
+            parentId: update.parentId ?? 0,
+            levelId: update.item.levelId,
+            id: { [Op.ne]: update.id } // Exclude the current item
+          },
+          transaction
+        });
+
+        if (existingLevel) {
+          throw {
+            error: `Level #${update.item.levelId} already exists in the target location`,
+            code: 400,
+            details: {
+              itemId: update.id,
+              levelId: update.item.levelId,
+              targetParentId: update.parentId ?? 0
+            }
+          };
+        }
+      }
+    }
+
+    // Perform all updates using bulkCreate with updateOnDuplicate to trigger hooks
+    if (enrichedUpdates.length > 0) {
+      // Prepare bulk create data - include required fields for Sequelize
+      const bulkData = enrichedUpdates.map(update => ({
+        id: update.id,
+        packId: resolvedPackId,
+        type: update.item.type, // Required field
+        sortOrder: update.sortOrder,
+        parentId: update.parentId ?? 0 // 0 = root level
+      }));
+
+      // Use bulkCreate with updateOnDuplicate to update existing records
+      // This triggers afterBulkCreate and afterBulkUpdate hooks
+      await LevelPackItem.bulkCreate(bulkData, {
+        updateOnDuplicate: ['parentId', 'sortOrder'],
+        transaction,
+        individualHooks: false // Use bulk hooks for efficiency
+      });
+    }
+
+    await transaction.commit();
+
+    await invalidatePackStructureLayers(resolvedPackId);
+
+    const treeRows = await LevelPackItem.findAll({
+      where: { packId: resolvedPackId },
+      attributes: ['id', 'type', 'parentId', 'sortOrder', 'name', 'levelId'],
+      order: [['sortOrder', 'ASC']],
+    });
+
+    const updatedTree = buildItemTree(treeRows.map((r) => r.toJSON()));
+
+    return res.json({ items: updatedTree });
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error updating pack tree:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error updating pack tree:', error);
+    return res.status(500).json({ error: 'Failed to update pack tree' });
+  }
+  }
+);
+
+// ==================== PACK OWNERSHIP TRANSFER ====================
+
+// GET /packs/users/search/:query - Search for users by username (admin only)
+router.get(
+  '/users/search/:query',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'getPacksUsersSearch',
+    summary: 'Search users (admin)',
+    description: 'Search users by username/nickname for pack transfer. Super admin only.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { query: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Users list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const query = req.params.query;
+    if (!query || query.length < 1) {
+      return res.json([]);
+    }
+
+    const users = await User.findAll({
+      where: {
+        [Op.or]: [
+          { username: { [Op.like]: `%${query}%` } },
+          { nickname: { [Op.like]: `%${query}%` } }
+        ]
+      },
+      attributes: ['id', 'username', 'nickname', 'avatarUrl'],
+      limit: 20,
+      order: [['username', 'ASC']]
+    });
+
+    return res.json(users);
+  } catch (error) {
+    logger.error('Error searching users:', error);
+    return res.status(500).json({ error: 'Failed to search users' });
+  }
+  }
+);
+
+// PUT /packs/:id/transfer-ownership - Transfer pack ownership to another user (admin only)
+router.put(
+  '/:id/transfer-ownership',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putPackTransferOwnership',
+    summary: 'Transfer pack ownership',
+    description: 'Transfer pack to another user. Super admin only.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'newOwnerId', schema: { type: 'object', properties: { newOwnerId: { type: 'string' } }, required: ['newOwnerId'] }, required: true },
+    responses: { 200: { description: 'Ownership transferred' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const { newOwnerId } = req.body;
+
+    if (!newOwnerId) {
+      throw { error: 'newOwnerId is required', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    // Check if new owner exists
+    const newOwner = await User.findByPk(newOwnerId, { transaction });
+    if (!newOwner) {
+      throw { error: 'New owner not found', code: 404 };
+    }
+
+    // Convert to string to match UUID type
+    const newOwnerIdString = String(newOwnerId);
+
+    // Don't allow transferring to the same owner
+    if (pack.ownerId === newOwnerIdString) {
+      throw { error: 'Pack is already owned by this user', code: 400 };
+    }
+
+    // Transfer ownership
+    await pack.update({ ownerId: newOwnerIdString }, { transaction });
+    await transaction.commit();
+
+    // Fetch updated pack with owner info
+    const updatedPack = await LevelPack.findByPk(resolvedPackId, {
+      include: [{
+        model: User,
+        as: 'packOwner',
+        attributes: ['id', 'nickname', 'username', 'avatarUrl']
+      }]
+    });
+
+    return res.json({
+      success: true,
+      message: 'Pack ownership transferred successfully',
+      pack: {
+        ...updatedPack!.toJSON(),
+        id: updatedPack!.linkCode
+      }
+    });
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error transferring pack ownership:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error transferring pack ownership:', error);
+    return res.status(500).json({ error: 'Failed to transfer pack ownership' });
+  }
+  }
+);
+
+// ==================== PACK FAVORITES OPERATIONS ====================
+
+// GET /packs/:id/favorite - Check if pack is favorited by current user
+router.get(
+  '/:id/favorite',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'getPackFavorite',
+    summary: 'Check favorite',
+    description: 'Check if current user has favorited the pack.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    responses: { 200: { description: 'isFavorited' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const resolvedPackId = await resolvePackId(req.params.id);
+    if (!resolvedPackId) {
+      return res.status(400).json({ error: 'Invalid pack ID or link code' });
+    }
+
+    const favorite = await PackFavorite.findOne({
+      where: {
+        userId: req.user!.id,
+        packId: resolvedPackId
+      }
+    });
+
+    return res.json({ isFavorited: !!favorite });
+  } catch (error) {
+    logger.error('Error checking favorite status:', error);
+    return res.status(500).json({ error: 'Failed to check favorite status' });
+  }
+  }
+);
+
+// PUT /packs/:id/favorite - Set pack favorite status explicitly
+router.put(
+  '/:id/favorite',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putPackFavorite',
+    summary: 'Set favorite',
+    description: 'Set or clear pack favorite (favorited: boolean).',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'favorited: boolean', schema: { type: 'object', properties: { favorited: { type: 'boolean' } }, required: ['favorited'] }, required: true },
+    responses: { 200: { description: 'Favorite updated' }, 400: { schema: errorResponseSchema }, 401: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const { favorited } = req.body;
+
+    if (typeof favorited !== 'boolean') {
+      throw { error: 'favorited must be a boolean value', code: 400 };
+    }
+
+    // Check if pack exists
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    // Check if pack is admin-locked
+    if (pack.viewMode === 4) { // FORCED_PRIVATE
+      throw { error: 'Cannot favorite admin-locked pack', code: 403 };
+    }
+
+    // Use upsert to handle race conditions and ensure desired state
+    if (favorited) {
+      // Try to create, but ignore if already exists (race condition)
+      try {
+        await PackFavorite.upsert({
+          packId: resolvedPackId,
+          userId: req.user?.id
+        }, { transaction });
+      } catch (error: any) {
+        // If it's a unique constraint error, the favorite already exists - that's fine
+        if (mapMysqlClientError(error)?.code !== 'ER_DUP_ENTRY') {
+          throw error;
+        }
+        logger.debug('Favorite already exists', { packId: resolvedPackId, userId: req.user?.id });
+        // Otherwise, silently succeed since the desired state is achieved
+      }
+    } else {
+      // Remove favorite if it exists
+      await PackFavorite.destroy({
+        where: {
+          packId: resolvedPackId,
+          userId: req.user?.id
+        },
+        transaction,
+      });
+    }
+
+    await transaction.commit();
+
+    // Get updated favorite count
+    const favoriteCount = await PackFavorite.count({
+      where: { packId: resolvedPackId },
+    });
+
+    return res.json({
+      success: true,
+      favorited: favorited,
+      favorites: favoriteCount
+    });
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error setting pack favorite status:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error setting pack favorite status:', error);
+    return res.status(500).json({ error: 'Failed to set pack favorite status' });
+  }
+  }
+);
+
+// DELETE /packs/:id/items/:itemId - Delete item
+router.delete(
+  '/:id/items/:itemId',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'deletePackItem',
+    summary: 'Delete pack item',
+    description: 'Remove a folder or level from a pack.',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: { schema: { type: 'string' } }, itemId: { schema: { type: 'string' } } },
+    responses: { 204: { description: 'Item deleted' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const itemId = parseInt(req.params.itemId);
+
+    if (isNaN(itemId)) {
+      throw { error: 'Invalid item ID', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    const item = await LevelPackItem.findOne({
+      where: { id: itemId, packId: resolvedPackId },
+      transaction
+    });
+
+    if (!item) {
+      throw { error: 'Item not found in pack', code: 404 };
+    }
+
+
+    await item.destroy({ transaction });
+    await transaction.commit();
+
+    return res.status(204).end();
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error deleting pack item:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error deleting pack item:', error);
+    return res.status(500).json({ error: 'Failed to delete pack item' });
+  }
+  }
+);
+
+// PUT /packs/:id/items/reorder - Reorder multiple items
+router.put(
+  '/:id/items/reorder',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'putPackItemsReorder',
+    summary: 'Reorder pack items',
+    description: 'Update parentId/sortOrder for multiple items. Body: items: [{ id, parentId?, sortOrder? }].',
+    tags: ['Database', 'Packs'],
+    security: ['bearerAuth'],
+    params: { id: stringIdParamSpec },
+    requestBody: { description: 'items: array of { id, parentId?, sortOrder? }', schema: { type: 'object', properties: { items: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, parentId: { type: 'integer' }, sortOrder: { type: 'integer' } } } } }, required: ['items'] }, required: true },
+    responses: { 200: { description: 'Items reordered' }, 400: { schema: errorResponseSchema }, 403: { schema: errorResponseSchema }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const resolvedPackId = await resolvePackId(req.params.id, transaction);
+    if (!resolvedPackId) {
+      throw { error: 'Invalid pack ID or link code', code: 400 };
+    }
+
+    const { items } = req.body;
+
+    if (!Array.isArray(items)) {
+      throw { error: 'items must be an array', code: 400 };
+    }
+
+    const pack = await LevelPack.findByPk(resolvedPackId, { transaction });
+    if (!pack) {
+      throw { error: 'Pack not found', code: 404 };
+    }
+
+    if (!canEditPack(pack, req.user)) {
+      throw { error: 'Access denied', code: 403 };
+    }
+
+    // Validate all items belong to this pack and check for unique constraint violations
+    const itemIds = items.map((item: any) => item.id).filter((id: any) => id !== undefined);
+    const packItems = await LevelPackItem.findAll({
+      where: {
+        packId: resolvedPackId,
+        id: { [Op.in]: itemIds }
+      },
+      transaction
+    });
+
+    if (packItems.length !== itemIds.length) {
+      throw { error: 'Some items do not belong to this pack', code: 400 };
+    }
+
+    const itemMap = new Map(packItems.map(item => [item.id, item]));
+
+    // Check for unique constraint violations before updating
+    // The constraint is on (packId, parentId, name) for folders
+    // For levels, check (packId, parentId, levelId) to prevent duplicates in same location
+    for (const { id, parentId } of items) {
+      if (id && parentId !== undefined) {
+        const item = itemMap.get(id);
+        if (item && item.type === 'folder' && item.name) {
+          // Check if moving this folder to the new parent would create a duplicate name
+          const existingFolder = await LevelPackItem.findOne({
+            where: {
+              packId: resolvedPackId,
+              type: 'folder',
+              parentId: parentId || 0,
+              name: item.name,
+              id: { [Op.ne]: id } // Exclude the current item
+            },
+            transaction
+          });
+
+          if (existingFolder) {
+            throw { error: `Folder "${item.name}" already exists in the target location`, code: 400 };
+          }
+        } else if (item && item.type === 'level' && item.levelId) {
+          // Check if moving this level to the new parent would create a duplicate levelId in same location
+          const existingLevel = await LevelPackItem.findOne({
+            where: {
+              packId: resolvedPackId,
+              type: 'level',
+              parentId: parentId || 0,
+              levelId: item.levelId,
+              id: { [Op.ne]: id } // Exclude the current item
+            },
+            transaction
+          });
+
+          if (existingLevel) {
+            throw { error: `Level #${item.levelId} already exists in the target location`, code: 400 };
+          }
+        }
+      }
+    }
+
+    // Update item sort orders and optionally parent
+    for (const { id, sortOrder, parentId } of items) {
+      if (id && sortOrder !== undefined) {
+        const updateData: any = { sortOrder };
+        if (parentId !== undefined) {
+          updateData.parentId = parentId || 0;
+        }
+
+        await LevelPackItem.update(
+          updateData,
+          {
+            where: { id, packId: resolvedPackId },
+            transaction
+          }
+        );
+      }
+    }
+
+    await transaction.commit();
+
+    return res.json({ success: true });
+
+  } catch (error: any) {
+    await safeTransactionRollback(transaction);
+    if (error.code) {
+      if (error.code === 500) logger.error('Error reordering pack items:', error);
+      return res.status(error.code).json(error);
+    }
+    logger.error('Error reordering pack items:', error);
+    return res.status(500).json({ error: 'Failed to reorder pack items' });
+  }
+  }
+);
+
+// ==================== CACHE INVALIDATION HOOKS ====================
+// Set up model listeners to automatically invalidate cache on database changes
+
+/**
+ * Helper function to invalidate cache for a pack by ID or linkCode
+ */
+const invalidatePackCacheById = async (packId: number): Promise<void> => {
+  try {
+    const pack = await LevelPack.findByPk(packId);
+    if (!pack) return;
+
+    const tags: string[] = ['packs:all'];
+    tags.push(`pack:${packId}`);
+    tags.push(`pack:${packId}:cdn`);
+    tags.push(...packDetailLayerTagsForFullInvalidation(packId, pack.linkCode));
+    if (pack.linkCode) {
+      tags.push(`pack:${pack.linkCode}`);
+      tags.push(`pack:${pack.linkCode}:cdn`);
+    }
+
+    await CacheInvalidation.invalidateTags(tags);
+    //logger.debug(`Cache invalidated for pack ${packId} (${pack.linkCode})`);
+  } catch (error) {
+    logger.error('Error invalidating pack cache in hook:', error);
+  }
+};
+
+// LevelPack hooks - invalidate cache when packs are created, updated, or deleted
+LevelPack.addHook('afterCreate', 'cacheInvalidationPackCreate', async (pack: LevelPack, options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(pack.id);
+    });
+  } else {
+    await invalidatePackCacheById(pack.id);
+  }
+});
+
+LevelPack.addHook('afterUpdate', 'cacheInvalidationPackUpdate', async (pack: LevelPack, options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(pack.id);
+    });
+  } else {
+    await invalidatePackCacheById(pack.id);
+  }
+});
+
+LevelPack.addHook('afterDestroy', 'cacheInvalidationPackDestroy', async (pack: LevelPack, options: any) => {
+  const packId = pack.id;
+  const linkCode = pack.linkCode;
+
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      const tags: string[] = ['packs:all'];
+      if (packId) tags.push(`pack:${packId}`);
+      if (linkCode) tags.push(`pack:${linkCode}`);
+      await CacheInvalidation.invalidateTags(tags);
+      //logger.debug(`Cache invalidated for deleted pack ${packId} (${linkCode})`);
+    });
+  } else {
+    const tags: string[] = ['packs:all'];
+    if (packId) tags.push(`pack:${packId}`);
+    if (linkCode) tags.push(`pack:${linkCode}`);
+    await CacheInvalidation.invalidateTags(tags);
+  }
+});
+
+LevelPack.addHook('afterBulkUpdate', 'cacheInvalidationPackBulkUpdate', async (options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      // Get all affected pack IDs
+      const affectedPacks = await LevelPack.findAll({
+        where: options.where,
+        attributes: ['id', 'linkCode']
+      });
+
+      const tags: string[] = ['packs:all'];
+      affectedPacks.forEach(pack => {
+        tags.push(`pack:${pack.id}`);
+        if (pack.linkCode) {
+          tags.push(`pack:${pack.linkCode}`);
+        }
+      });
+
+      if (tags.length > 1) {
+        await CacheInvalidation.invalidateTags([...new Set(tags)]);
+        //logger.debug(`Cache invalidated for ${affectedPacks.length} packs (bulk update)`);
+      }
+    });
+  }
+});
+
+// LevelPackItem hooks - invalidate cache when pack items are created, updated, or deleted
+LevelPackItem.addHook('afterCreate', 'cacheInvalidationPackItemCreate', async (item: LevelPackItem, options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(item.packId);
+    });
+  } else {
+    await invalidatePackCacheById(item.packId);
+  }
+});
+
+LevelPackItem.addHook('afterUpdate', 'cacheInvalidationPackItemUpdate', async (item: LevelPackItem, options: any) => {
+  const fields = options.fields as string[] | undefined;
+  const run = async () => {
+    if (!fields || fields.length === 0) {
+      await invalidatePackCacheById(item.packId);
+      return;
+    }
+    if (fields.some((f) => f === 'levelId' || f === 'type' || f === 'packId')) {
+      await invalidatePackCacheById(item.packId);
+      return;
+    }
+    await invalidatePackStructureLayers(item.packId);
+  };
+  if (options.transaction) {
+    await options.transaction.afterCommit(run);
+  } else {
+    await run();
+  }
+});
+
+LevelPackItem.addHook('afterDestroy', 'cacheInvalidationPackItemDestroy', async (item: LevelPackItem, options: any) => {
+  const packId = item.packId;
+
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(packId);
+    });
+  } else {
+    await invalidatePackCacheById(packId);
+  }
+});
+
+LevelPackItem.addHook('afterBulkCreate', 'cacheInvalidationPackItemBulkCreate', async (instances: LevelPackItem[], options: any) => {
+  const runBulk = async () => {
+    const packIds = [...new Set(instances.map((item) => item.packId))];
+
+    for (const packId of packIds) {
+      await invalidatePackCacheById(packId);
+    }
+
+    if (packIds.length > 0) {
+      //logger.debug(`Cache invalidated for ${packIds.length} packs (bulk item create)`);
+    }
+  };
+
+  if (options.transaction) {
+    await options.transaction.afterCommit(runBulk);
+  } else {
+    await runBulk();
+  }
+});
+
+LevelPackItem.addHook('afterBulkUpdate', 'cacheInvalidationPackItemBulkUpdate', async (options: any) => {
+  const runBulk = async () => {
+    const affectedItems = await LevelPackItem.findAll({
+      where: options.where,
+      attributes: ['packId'],
+    });
+
+    const packIds = [...new Set(affectedItems.map((row) => row.packId))];
+
+    for (const packId of packIds) {
+      await invalidatePackStructureLayers(packId);
+    }
+
+    if (packIds.length > 0) {
+      //logger.debug(`Pack structure cache invalidated for ${packIds.length} packs (bulk item update)`);
+    }
+  };
+
+  if (options.transaction) {
+    await options.transaction.afterCommit(runBulk);
+  } else {
+    await runBulk();
+  }
+});
+
+LevelPackItem.addHook('afterBulkDestroy', 'cacheInvalidationPackItemBulkDestroy', async (options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      // Get pack IDs from destroyed items (before they were deleted)
+      // We need to check the where clause to find affected packs
+      const affectedItems = await LevelPackItem.findAll({
+        where: options.where,
+        attributes: ['packId'],
+        group: ['packId']
+      }).catch(() => {
+        // If items are already deleted, try to infer from where clause
+        if (options.where?.packId) {
+          return [{ packId: options.where.packId }];
+        }
+        return [];
+      });
+
+      const packIds = [...new Set(affectedItems.map(item => item.packId))];
+
+      for (const packId of packIds) {
+        await invalidatePackCacheById(packId);
+      }
+
+      if (packIds.length > 0) {
+        //logger.debug(`Cache invalidated for ${packIds.length} packs (bulk item destroy)`);
+      }
+    });
+  }
+});
+
+// PackFavorite hooks - invalidate cache when favorites change (affects favorites count)
+PackFavorite.addHook('afterCreate', 'cacheInvalidationPackFavoriteCreate', async (favorite: PackFavorite, options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(favorite.packId);
+    });
+  } else {
+    await invalidatePackCacheById(favorite.packId);
+  }
+});
+
+PackFavorite.addHook('afterDestroy', 'cacheInvalidationPackFavoriteDestroy', async (favorite: PackFavorite, options: any) => {
+  const packId = favorite.packId;
+
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      await invalidatePackCacheById(packId);
+    });
+  } else {
+    await invalidatePackCacheById(packId);
+  }
+});
+
+PackFavorite.addHook('afterBulkCreate', 'cacheInvalidationPackFavoriteBulkCreate', async (instances: PackFavorite[], options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      const packIds = [...new Set(instances.map(fav => fav.packId))];
+
+      for (const packId of packIds) {
+        await invalidatePackCacheById(packId);
+      }
+
+      //logger.debug(`Cache invalidated for ${packIds.length} packs (bulk favorite create)`);
+    });
+  }
+});
+
+PackFavorite.addHook('afterBulkDestroy', 'cacheInvalidationPackFavoriteBulkDestroy', async (options: any) => {
+  if (options.transaction) {
+    await options.transaction.afterCommit(async () => {
+      // Try to get pack IDs from where clause
+      if (options.where?.packId) {
+        await invalidatePackCacheById(options.where.packId);
+      } else if (options.where?.userId) {
+        // If deleting by user, we need to find affected packs
+        // This is less common, so we'll invalidate all packs list
+        await CacheInvalidation.invalidateTag('packs:all');
+        //logger.debug('Cache invalidated for all packs (bulk favorite destroy by user)');
+      }
+    });
+  }
+});
+
+export default router;
