@@ -1,0 +1,416 @@
+import {Model} from 'sequelize';
+import {UserAttributes} from '@/models/auth/User.js';
+import DirectiveAction from '@/models/announcements/DirectiveAction.js';
+import { CreatorAlias } from '@/models/credits/CreatorAlias.js';
+import { TeamAlias } from '@/models/credits/TeamAlias.js';
+import LevelAlias from '@/models/levels/LevelAlias.js';
+import LevelCredit from '@/models/levels/LevelCredit.js';
+import Team from '@/models/credits/Team.js';
+import TeamMember from '@/models/credits/TeamMember.js';
+
+export interface PaginationQuery {
+  page: number;
+  offset: number;
+  limit: number;
+}
+
+
+// Base interface for common fields
+export interface IBaseModel {
+  id: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Base interface for model attributes (without id for junction tables)
+export interface IBaseModelAttributes {
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ICreator extends IBaseModel {
+  name: string;
+  verificationStatus: 'declined' | 'pending' | 'conditional' | 'allowed';
+  userId?: string | null;
+  bio?: string | null;
+  bioCanvas?: Record<string, unknown> | null;
+  bioCanvasImageAssets?: Record<string, { assetId: string; url: string }> | null;
+  /** Profile header: up to 5 curation type ids chosen by the creator (or admin). */
+  displayCurationTypeIds?: number[] | null;
+  /** Whitelisted relative path under `client/public/banners` (e.g. `banners/default.svg`). */
+  bannerPreset?: string | null;
+  customBannerId?: string | null;
+  customBannerUrl?: string | null;
+  profileHeaderSurfaceStyle?: Record<string, unknown> | null;
+  profileHeaderSurfaceImageAssets?: Record<string, { assetId: string; url: string }> | null;
+  /** Free-text policy for chart uploads (shown to visitors when set). */
+  uploadConditions?: string | null;
+  /** TUFStellar icon variant on creator cards/profile: `1` | `2` | `3`. */
+  tufStellarIconVariant?: string;
+  featuredPlacementIds?: number[] | null;
+  hiddenPlacementIds?: number[] | null;
+  placementOrderIds?: number[] | null;
+  /** Tournament placement card layout: `default` | `iconRail`. */
+  placementCardLayout?: string;
+  placementDisplayMode?: 'defaultHierarchy' | 'customLayers';
+  /** When false, the public profile header hides followerCount. Default true. */
+  showFollowerCount?: boolean;
+  creatorAliases: CreatorAlias[];
+  creatorTeams?: ITeam[];
+  teamMemberships?: any[];
+}
+
+// Level interface
+export interface ILevel extends IBaseModel {
+  id: number;
+  song: string;
+  artist: string;
+  charter?: string;
+  charters?: string[];
+  vfxer?: string;
+  vfxers?: string[];
+  team?: string;
+  diffId: number;
+  baseScore: number | null;
+  ppBaseScore: number | null;
+  previousBaseScore: number | null;
+  clears: number;
+  likes: number;
+  /** Persistent per-level download counter (server-owned). */
+  downloadCount?: number;
+  videoLink: string;
+  dlLink: string;
+  /** Indexed CDN fileId derived from `dlLink` (kept in sync via Level hooks). Null for non-CDN or removed links. */
+  fileId?: string | null;
+  legacyDllink?: string | null;
+  workshopLink: string;
+  publicComments: string;
+  notes?: string | null;
+  toRate: boolean;
+  rerateReason?: string;
+  rerateNum: string;
+  previousDiffId?: number;
+  isAnnounced: boolean;
+  isDeleted: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+  isHidden?: boolean;
+  isExternallyAvailable: boolean;
+  teamId?: number | null;
+  songId?: number | null;
+  suffix?: string | null;
+  /** Chart BPM from CDN cache (denormalized). */
+  bpm?: number | null;
+  /** Tile count from CDN cache (denormalized). */
+  tilecount?: number | null;
+  /** Auto tile count from CDN cache `analysis.autoTileCount` (denormalized). */
+  autoTileCount?: number | null;
+  /** Chart length in ms from CDN cache `analysis.levelLengthInMs` (denormalized). */
+  levelLengthInMs?: number | null;
+  /** Per-level xacc curve configuration + pins (null = site defaults). */
+  xaccCurveMeta?: unknown | null;
+  passes?: IPass[];
+  aliases?: LevelAlias[] | null;
+  levelCredits?: LevelCredit[] | null;
+  difficulty?: IDifficulty;
+  previousDifficulty?: IDifficulty;
+  levelCreators?: ICreator[];
+  teamObject?: Team;
+  highestAccuracy?: number | null;
+  firstPass?: IPass | null;
+  firstPPPass?: IPass | null;
+  tags?: ILevelTag[];
+}
+
+// Pass interface
+export interface IPass extends IBaseModel {
+  levelId: number;
+  speed: number | null;
+  playerId: number;
+  feelingRating: string | null;
+  expectedRating: string | null;
+  keyCount: number | null;
+  vidTitle: string | null;
+  videoLink: string | null;
+  vidUploadTime: Date | null;
+  is12K: boolean | null;
+  is16K: boolean | null;
+  isNoHoldTap: boolean | null;
+  isWorldsFirst: boolean | null;
+  isWorldsFirstPP: boolean | null;
+  accuracy: number | null;
+  scoreV2: number | null;
+  isAnnounced: boolean | null;
+  isDeleted: boolean | null;
+  isHidden: boolean | null;
+  isDuplicate: boolean | null;
+  isAdofaiV2: boolean | null;
+  createdAt: Date;
+  updatedAt: Date;
+  level?: ILevel;
+  player?: IPlayer;
+  judgements?: IJudgement;
+}
+
+// Player interface
+export interface IPlayer extends IBaseModel {
+  name: string;
+  country: string;
+  isBanned: boolean;
+  /** Temporary ban expiry. Null with isBanned means permanent / not timed. */
+  bannedUntil?: Date | null;
+  isSubmissionsPaused: boolean;
+  pfp?: string | null;
+  bio?: string | null;
+  /** Whitelisted relative path under `client/public/banners`. */
+  bannerPreset?: string | null;
+  customBannerId?: string | null;
+  customBannerUrl?: string | null;
+  profileHeaderSurfaceStyle?: Record<string, unknown> | null;
+  profileHeaderSurfaceImageAssets?: Record<string, { assetId: string; url: string }> | null;
+  bioCanvas?: Record<string, unknown> | null;
+  bioCanvasImageAssets?: Record<string, { assetId: string; url: string }> | null;
+  /** TUFStellar icon variant on player cards/profile: `1` | `2` | `3`. */
+  tufStellarIconVariant?: string;
+  featuredPlacementIds?: number[] | null;
+  hiddenPlacementIds?: number[] | null;
+  placementOrderIds?: number[] | null;
+  /** Tournament placement card layout: `default` | `iconRail`. */
+  placementCardLayout?: string;
+  placementDisplayMode?: 'defaultHierarchy' | 'customLayers';
+  /** When false, the public profile header hides followerCount. Default true. */
+  showFollowerCount?: boolean;
+
+  // Associations
+  user?: Model<UserAttributes>;
+
+  // Virtual fields
+  rankedScore?: number;
+  generalScore?: number;
+  totalScoreV2?: number;
+  ppScore?: number;
+  wfScore?: number;
+  score12K?: number;
+  averageXacc?: number;
+  totalPasses?: number;
+  universalPassCount?: number;
+  worldsFirstCount?: number;
+  wfPPScore?: number;
+  worldsFirstPPCount?: number;
+  topDiff?: IDifficulty;
+  top12kDiff?: IDifficulty;
+}
+
+// Rating interface
+export interface IRating extends IBaseModel {
+  levelId: number;
+  currentDiff: string;
+  lowDiff: boolean;
+  requesterFR: string;
+  average: string;
+}
+
+// RatingDetail interface
+export interface IRatingDetail extends IBaseModel {
+  ratingId: number;
+  username: string;
+  rating: string;
+  comment: string;
+}
+
+export interface IJudgement extends IBaseModel {
+  earlyDouble: number;
+  earlySingle: number;
+  ePerfect: number;
+  perfect: number;
+  lPerfect: number;
+  lateSingle: number;
+  lateDouble: number;
+  accuracy: number | null;
+}
+
+// Model instance types
+export type LevelInstance = Model<ILevel>;
+export type PassInstance = Model<IPass>;
+export type PlayerInstance = Model<IPlayer>;
+export type RatingInstance = Model<IRating>;
+export type RatingDetailInstance = Model<IRatingDetail>;
+export type JudgementInstance = Model<IJudgement>;
+
+// Add a new interface for the ratings reference table
+export interface IDifficulty extends IBaseModel {
+  name: string; // The display name (P1, G1, U1, etc.)
+  baseScore: number;
+  legacy: string;
+  type: 'PGU' | 'SPECIAL'; // To distinguish between PGU and special ratings
+  icon: string; // The icon filename from iconResolver
+  color: string;
+  legacyIcon: string | null;
+  legacyEmoji: string | null;
+  emoji: string;
+  sortOrder: number;
+  referenceLvels?: ILevel[];
+}
+
+// PassSubmission interfaces
+export interface IPassSubmissionJudgements {
+  passSubmissionId: number;
+  earlyDouble: number;
+  earlySingle: number;
+  ePerfect: number;
+  perfect: number;
+  lPerfect: number;
+  lateSingle: number;
+  lateDouble: number;
+}
+
+export interface IPassSubmissionFlags {
+  passSubmissionId: number;
+  is12K: boolean;
+  isNoHoldTap: boolean;
+  is16K: boolean;
+  isAdofaiV2: boolean;
+}
+
+export interface IPassSubmission extends IBaseModel {
+  levelId: number;
+  speed: number;
+  passer: string;
+  feelingDifficulty: string;
+  title: string;
+  videoLink: string;
+  rawTime: Date;
+  status: 'pending' | 'approved' | 'declined';
+  isLocked?: boolean;
+  assignedPlayerId?: number | null;
+
+  // Associations
+  assignedPlayer?: IPlayer;
+  judgements?: IPassSubmissionJudgements;
+  flags?: IPassSubmissionFlags;
+  level?: ILevel;
+}
+
+export interface ITeam extends IBaseModel {
+  name: string;
+  teamCreators: ICreator[];
+  teamMembers?: TeamMember[];
+  description?: string | null;
+  teamAliases?: TeamAlias[] | null;
+}
+
+export interface IAnnouncementChannel {
+  id?: number;
+  label: string;
+  webhookUrl: string;
+  isActive: boolean;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export interface IAnnouncementRole {
+  id?: number;
+  roleId: string;
+  label: string;
+  messageFormat?: string;
+  isActive: boolean;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export enum ConditionOperator {
+  EQUAL = 'EQUAL',
+  NOT_EQUAL = 'NOT_EQUAL',
+  GREATER_THAN = 'GREATER_THAN',
+  LESS_THAN = 'LESS_THAN',
+  GREATER_THAN_EQUAL = 'GREATER_THAN_EQUAL',
+  LESS_THAN_OR_EQUAL = 'LESS_THAN_OR_EQUAL',
+  CUSTOM = 'CUSTOM',
+}
+
+export enum DirectiveConditionType {
+  ACCURACY = 'ACCURACY',
+  WORLDS_FIRST = 'WORLDS_FIRST',
+  WORLDS_FIRST_PP = 'WORLDS_FIRST_PP',
+  BASE_SCORE = 'BASE_SCORE',
+  CUSTOM = 'CUSTOM',
+}
+
+export type DirectiveCondition = {
+  type: DirectiveConditionType;
+  value?: number | string;
+  operator?: ConditionOperator;
+  customFunction?: string; // JavaScript function as string
+}
+
+export interface IAnnouncementDirective {
+  id?: number;
+  difficultyId: number;
+  name: string;
+  description: string;
+  mode: 'STATIC' | 'CONDITIONAL';
+  triggerType: 'PASS' | 'LEVEL';
+  condition: DirectiveCondition;
+  isActive: boolean;
+  firstOfKind: boolean;
+  sortOrder: number;
+  createdAt?: Date;
+  updatedAt?: Date;
+  actions?: DirectiveAction[];
+}
+
+export type LevelAnnouncementFacet = 'DIFF' | 'BASE_SCORE' | 'PP_BASE_SCORE' | 'CURVE';
+
+export type LevelAnnouncementKind = 'NEW' | 'RERATE';
+
+export type LevelAnnouncementQueueStatus = 'PENDING' | 'ANNOUNCED' | 'SKIPPED';
+
+export type LevelAnnouncementCurveSnapshot = {
+  poleOffset: number;
+  topMultiplier: number;
+};
+
+export type LevelAnnouncementSnapshot = {
+  diffId?: number;
+  /** Level override (`levels.baseScore`); may be null when the difficulty default applies. */
+  baseScore?: number | null;
+  /** `difficulties.baseScore` captured at snapshot time for the snapshot `diffId`. */
+  difficultyBaseScore?: number | null;
+  ppBaseScore?: number | null;
+  curve?: LevelAnnouncementCurveSnapshot | null;
+};
+
+export interface ILevelAnnouncementQueue extends IBaseModel {
+  levelId: number;
+  kind: LevelAnnouncementKind;
+  facets: LevelAnnouncementFacet[];
+  before: LevelAnnouncementSnapshot;
+  after: LevelAnnouncementSnapshot;
+  status: LevelAnnouncementQueueStatus;
+  pendingUniqueKey: number | null;
+  enqueuedBy: string | null;
+  announcedAt: Date | null;
+}
+
+// LevelTag interface
+export interface ILevelTag extends IBaseModel {
+  name: string;
+  icon: string | null; // Full CDN URL for icon
+  color: string; // Hex color code (e.g., "#FF5733")
+  groupId?: number | null;
+  sortOrder?: number;
+  isCommunity?: boolean;
+  passWarningEnabled?: boolean;
+  pinned?: boolean;
+  score?: number | null;
+  /** Serialized group name from `level_tag_groups` (not a DB column). */
+  group?: string | null;
+  /** Serialized group sort order from `level_tag_groups` (not a DB column). */
+  groupSortOrder?: number | null;
+}
+
+export interface ILevelTagGroup extends IBaseModel {
+  name: string;
+  sortOrder: number;
+}
+

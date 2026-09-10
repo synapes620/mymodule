@@ -1,0 +1,243 @@
+import Level from './levels/Level.js';
+import Pass from './passes/Pass.js';
+import Player from './players/Player.js';
+import Rating from './levels/Rating.js';
+import RatingDetail from './levels/RatingDetail.js';
+import Judgement from './passes/Judgement.js';
+import LevelSubmission from './submissions/LevelSubmission.js';
+import Difficulty from './levels/Difficulty.js';
+import {
+  PassSubmission,
+  PassSubmissionJudgements,
+  PassSubmissionFlags,
+} from './submissions/PassSubmission.js';
+import sequelize from '@/config/db.js';
+import {initializeAssociations} from './associations.js';
+import User from './auth/User.js';
+import OAuthProvider from './auth/OAuthProvider.js';
+import RefreshToken from './auth/RefreshToken.js';
+import StepUpCode from './auth/StepUpCode.js';
+import TrustedDevice from './auth/TrustedDevice.js';
+import PasskeyCredential from './auth/PasskeyCredential.js';
+import WebAuthnChallenge from './auth/WebAuthnChallenge.js';
+import Creator from './credits/Creator.js';
+import LevelCredit from './levels/LevelCredit.js';
+import LevelLinkGroup from './levels/LevelLinkGroup.js';
+import LevelLinkMember from './levels/LevelLinkMember.js';
+import LevelTag from './levels/LevelTag.js';
+import LevelTagGroup from './levels/LevelTagGroup.js';
+import LevelTagAssignment from './levels/LevelTagAssignment.js';
+import LevelTagVote from './levels/LevelTagVote.js';
+import Team from './credits/Team.js';
+import TeamMember from './credits/TeamMember.js';
+import PlayerStats from './players/PlayerStats.js';
+import PlayerLeaderboardRankEvent from './players/PlayerLeaderboardRankEvent.js';
+import UsernameChange from './auth/UsernameChange.js';
+import UserClientPreferences from './auth/UserClientPreferences.js';
+import UserYoutubeChannel from './auth/UserYoutubeChannel.js';
+import ProfileActionLog from './auth/ProfileActionLog.js';
+import AnnouncementChannel from './announcements/AnnouncementChannel.js';
+import AnnouncementRole from './announcements/AnnouncementRole.js';
+import AnnouncementDirective from './announcements/AnnouncementDirective.js';
+import DirectiveAction from './announcements/DirectiveAction.js';
+import RateLimit from './auth/RateLimit.js';
+import LevelSearchView from './levels/LevelSearchView.js';
+import AuditLog from './admin/AuditLog.js';
+import {CurationType, Curation, CurationSchedule} from './curations/index.js';
+import {LevelPack, LevelPackItem} from './packs/index.js';
+import Artist from './artists/Artist.js';
+import ArtistAlias from './artists/ArtistAlias.js';
+import ArtistLink from './artists/ArtistLink.js';
+import ArtistEvidence from './artists/ArtistEvidence.js';
+import Song from './songs/Song.js';
+import SongCredit from './songs/SongCredit.js';
+import SongAlias from './songs/SongAlias.js';
+import SongLink from './songs/SongLink.js';
+import SongEvidence from './songs/SongEvidence.js';
+import LevelSubmissionSongRequest from './submissions/LevelSubmissionSongRequest.js';
+import LevelSubmissionArtistRequest from './submissions/LevelSubmissionArtistRequest.js';
+import LevelSubmissionEvidence from './submissions/LevelSubmissionEvidence.js';
+import { DiscordGuild, DiscordSyncRole } from './discord/index.js';
+import UploadSession from './upload/UploadSession.js';
+import HealthLatencySample from './health/HealthLatencySample.js';
+import BillingEvent from './billing/BillingEvent.js';
+import UserTufStellarBilling from './billing/UserTufStellarBilling.js';
+import UserTufStellarEntitlementSegment from './billing/UserTufStellarEntitlementSegment.js';
+import UserTufStellarAdminGrant from './billing/UserTufStellarAdminGrant.js';
+import TournamentSeries from './tournaments/TournamentSeries.js';
+import Tournament from './tournaments/Tournament.js';
+import TournamentTier from './tournaments/TournamentTier.js';
+import TournamentPlacement from './tournaments/TournamentPlacement.js';
+import PlacementReward from './tournaments/PlacementReward.js';
+import PlacementEntitlement from './tournaments/PlacementEntitlement.js';
+import EquippedCosmetic from './tournaments/EquippedCosmetic.js';
+import ProfileCustomizationPiece from './profile/ProfileCustomizationPiece.js';
+import OAuthClient from './oauth/OAuthClient.js';
+import OAuthGrant from './oauth/OAuthGrant.js';
+import OAuthAuthorizationCode from './oauth/OAuthAuthorizationCode.js';
+import OAuthRefreshToken from './oauth/OAuthRefreshToken.js';
+import Notification from './notifications/Notification.js';
+import NotificationPreference from './notifications/NotificationPreference.js';
+import NotificationCategoryPreference from './notifications/NotificationCategoryPreference.js';
+import UserFollow from './notifications/UserFollow.js';
+import NotificationUserSettings from './notifications/NotificationUserSettings.js';
+import PushSubscription from './notifications/PushSubscription.js';
+import ChartClearNotificationMute from './notifications/ChartClearNotificationMute.js';
+import UsefulLink from './misc/UsefulLink.js';
+import UsefulLinkLocale from './misc/UsefulLinkLocale.js';
+import UsefulLinkGroup from './misc/UsefulLinkGroup.js';
+import UsefulLinkGroupAssignment from './misc/UsefulLinkGroupAssignment.js';
+import UsefulLinkGroupLocale from './misc/UsefulLinkGroupLocale.js';
+import Mod from './misc/Mod.js';
+import ModAssignee from './misc/ModAssignee.js';
+import ModVersion from './misc/ModVersion.js';
+import ModTag from './misc/ModTag.js';
+import ModTagAssignment from './misc/ModTagAssignment.js';
+import ModLike from './misc/ModLike.js';
+import ModDownloadUnique from './misc/ModDownloadUnique.js';
+import ModSlugRedirect from './misc/ModSlugRedirect.js';
+// Create db object with models first
+export const db = {
+  sequelize,
+  models: {
+    Level,
+    Pass,
+    Player,
+    Rating,
+    RatingDetail,
+    Judgement,
+    LevelSubmission,
+    PassSubmission,
+    PassSubmissionJudgements,
+    PassSubmissionFlags,
+    Difficulty,
+    User,
+    OAuthProvider,
+    RefreshToken,
+    StepUpCode,
+    TrustedDevice,
+    PasskeyCredential,
+    WebAuthnChallenge,
+    Creator,
+    LevelCredit,
+    LevelLinkGroup,
+    LevelLinkMember,
+    LevelTag,
+    LevelTagGroup,
+    LevelTagAssignment,
+    LevelTagVote,
+    Team,
+    TeamMember,
+    PlayerStats,
+    PlayerLeaderboardRankEvent,
+    UsernameChange,
+    UserClientPreferences,
+    UserYoutubeChannel,
+    ProfileActionLog,
+    AnnouncementChannel,
+    AnnouncementRole,
+    AnnouncementDirective,
+    DirectiveAction,
+    RateLimit,
+    LevelSearchView,
+    AuditLog,
+    CurationType,
+    Curation,
+    CurationSchedule,
+    LevelPack,
+    LevelPackItem,
+    Artist,
+    ArtistAlias,
+    ArtistLink,
+    ArtistEvidence,
+    Song,
+    SongCredit,
+    SongAlias,
+    SongLink,
+    SongEvidence,
+    LevelSubmissionSongRequest,
+    LevelSubmissionArtistRequest,
+    LevelSubmissionEvidence,
+    DiscordGuild,
+    DiscordSyncRole,
+    UploadSession,
+    HealthLatencySample,
+    BillingEvent,
+    UserTufStellarBilling,
+    UserTufStellarEntitlementSegment,
+    UserTufStellarAdminGrant,
+    TournamentSeries,
+    Tournament,
+    TournamentTier,
+    TournamentPlacement,
+    PlacementReward,
+    PlacementEntitlement,
+    EquippedCosmetic,
+    ProfileCustomizationPiece,
+    OAuthClient,
+    OAuthGrant,
+    OAuthAuthorizationCode,
+    OAuthRefreshToken,
+    Notification,
+    NotificationPreference,
+    NotificationCategoryPreference,
+    UserFollow,
+    NotificationUserSettings,
+    PushSubscription,
+    ChartClearNotificationMute,
+    UsefulLink,
+    UsefulLinkLocale,
+    UsefulLinkGroup,
+    UsefulLinkGroupAssignment,
+    UsefulLinkGroupLocale,
+    Mod,
+    ModAssignee,
+    ModVersion,
+    ModTag,
+    ModTagAssignment,
+    ModLike,
+    ModDownloadUnique,
+    ModSlugRedirect,
+  },
+};
+
+// Initialize associations after models are defined
+initializeAssociations();
+
+// Associations are now handled in individual association files
+
+export default db;
+
+// Also export User, OAuthProvider, RefreshToken, etc. directly for convenience
+export {
+  User,
+  OAuthProvider,
+  RefreshToken,
+  StepUpCode,
+  TrustedDevice,
+  PasskeyCredential,
+  WebAuthnChallenge,
+  RateLimit,
+  ProfileActionLog,
+  UserClientPreferences,
+  UserYoutubeChannel,
+  AuditLog,
+  BillingEvent,
+  UserTufStellarBilling,
+  UserTufStellarEntitlementSegment,
+  UserTufStellarAdminGrant,
+  OAuthClient,
+  OAuthGrant,
+  OAuthAuthorizationCode,
+  OAuthRefreshToken,
+  Notification,
+  NotificationPreference,
+  NotificationCategoryPreference,
+  UserFollow,
+  NotificationUserSettings,
+  PushSubscription,
+  ChartClearNotificationMute,
+};
+
+// Export Discord models
+export {DiscordGuild, DiscordSyncRole};

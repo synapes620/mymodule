@@ -1,0 +1,45 @@
+{
+  "extends": "./node_modules/gts/",
+  "plugins": ["tuf"],
+  "overrides": [
+    {
+      "files": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/**/*.jsx"],
+      "excludedFiles": [
+        "src/server/services/outbox/handlers/discord/**/*",
+        "src/server/services/outbox/discordOutboxDispatcher.ts",
+        "src/server/routes/v2/webhooks/webhook.ts",
+        "src/server/routes/v2/webhooks/embeds.ts"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "@/misc/webhook/index.js",
+                "message": "Use OutboxService + discord handlers instead of calling webhooks directly."
+              },
+              {
+                "name": "@/misc/webhook",
+                "message": "Use OutboxService + discord handlers instead of calling webhooks directly."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "rules": {
+    "@typescript-eslint/no-namespace": "off",
+    "@typescript-eslint/no-explicit-any": "off",
+    "n/no-process-exit": "off",
+    "n/no-extraneous-import": "off",
+    "no-control-regex": "off",
+    "prefer-const": "off",
+    "no-case-declarations": "off",
+    // Add any other rules you want to disable here
+    "prettier/prettier": "off",
+    "tuf/no-unsafe-user-include": "error"
+  },
+  "ignorePatterns": ["dist/**/*", "build/**/*", "node_modules/**/*", "uploads/**/*", "temp/**/*", "cache/**/*", "backups/**/*", "profiles/**/*", "src/database/generate_meta_inserts.bat", "src/database/meta_inserts.sql", "*.sh", "__pycache__/**/*", "eslint-plugin-tuf/**/*"]
+}

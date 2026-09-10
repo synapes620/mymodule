@@ -1,0 +1,345 @@
+import {Model, DataTypes, Optional} from 'sequelize';
+import {
+  ILevel,
+  IPass,
+  IDifficulty,
+  ICreator
+} from '@/server/interfaces/models/index.js';
+import LevelCredit from './LevelCredit.js';
+import LevelAlias from './LevelAlias.js';
+import Team from '@/models/credits/Team.js';
+import Curation from '@/models/curations/Curation.js';
+import Rating from './Rating.js';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+import LevelTag from './LevelTag.js';
+import Song from '@/models/songs/Song.js';
+import SongCredit from '@/models/songs/SongCredit.js';
+const sequelize = getSequelizeForModelGroup('levels');
+
+type LevelAttributes = ILevel;
+type LevelCreationAttributes = Optional<
+  LevelAttributes,
+  'id' | 'createdAt' | 'updatedAt'
+>;
+
+class Level
+  extends Model<LevelAttributes, LevelCreationAttributes>
+  implements ILevel
+{
+  declare id: number;
+  declare song: string;
+  declare artist: string;
+  declare songId: number | null;
+  declare suffix: string | null;
+  declare diffId: number;
+  declare baseScore: number | null;
+  declare ppBaseScore: number | null;
+  declare previousBaseScore: number | null;
+  declare clears: number;
+  declare likes: number;
+  declare downloadCount: number;
+  declare videoLink: string;
+  declare dlLink: string;
+  declare fileId: string | null;
+  declare legacyDllink: string | null;
+  declare workshopLink: string;
+  declare publicComments: string;
+  declare notes: string | null;
+  declare toRate: boolean;
+  declare rerateReason: string;
+  declare rerateNum: string;
+  declare previousDiffId: number;
+  declare isAnnounced: boolean;
+  declare isDeleted: boolean;
+  declare createdAt: Date;
+  declare updatedAt: Date;
+  declare isHidden: boolean;
+  declare isExternallyAvailable: boolean;
+  declare teamId: number | null;
+  declare teamObject: Team;
+  declare highestAccuracy: number | null;
+  declare firstPass: IPass | null;
+  declare firstPPPass: IPass | null;
+  // Virtual fields from associations
+  declare passes?: IPass[];
+  declare difficulty: IDifficulty;
+  declare previousDifficulty?: IDifficulty;
+  declare levelCreators?: ICreator[];
+  declare levelCredits?: LevelCredit[];
+  declare aliases?: LevelAlias[] | null;
+  /** @deprecated use curations; kept for API responses as theme curation alias */
+  declare curation?: Curation | null;
+  declare curations?: Curation[];
+  declare ratings?: Rating[] | null;
+
+  declare charter: string;
+  declare vfxer: string;
+  declare team: string;
+  declare charters: string[];
+  declare vfxers: string[];
+  declare tags?: LevelTag[];
+
+  // Associations for normalized song
+  declare songObject?: Song;
+  declare songCredits?: SongCredit[];
+  declare bpm: number | null;
+  declare tilecount: number | null;
+  declare autoTileCount: number | null;
+  declare levelLengthInMs: number | null;
+  /** Per-level xacc curve configuration + pins (null = site defaults). */
+  declare xaccCurveMeta: unknown | null;
+}
+
+Level.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    song: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    artist: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    diffId: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: {
+        model: 'difficulties',
+        key: 'id',
+      },
+    },
+    baseScore: {
+      type: DataTypes.DOUBLE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    ppBaseScore: {
+      type: DataTypes.DOUBLE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    previousBaseScore: {
+      type: DataTypes.DOUBLE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    videoLink: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    dlLink: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    fileId: {
+      type: DataTypes.CHAR(36),
+      allowNull: true,
+      defaultValue: null,
+    },
+    legacyDllink: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null
+    },
+    workshopLink: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    publicComments: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    notes: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    toRate: {
+      type: DataTypes.BOOLEAN,
+      allowNull: true,
+    },
+    rerateReason: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    rerateNum: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    previousDiffId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'difficulties',
+        key: 'id',
+      },
+    },
+    isAnnounced: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    isDeleted: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+    isHidden: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    isExternallyAvailable: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    teamId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'teams',
+        key: 'id',
+      },
+    },
+    songId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'songs',
+        key: 'id',
+      },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+    },
+    suffix: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      defaultValue: null,
+    },
+    bpm: {
+      type: DataTypes.DOUBLE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    tilecount: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    autoTileCount: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    levelLengthInMs: {
+      type: DataTypes.DOUBLE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    xaccCurveMeta: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: null,
+    },
+    clears: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    likes: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    downloadCount: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    firstPass: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.passes ? this.passes.find(pass => pass.isWorldsFirst) : null;
+      },
+    },
+    firstPPPass: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.passes ? this.passes.find(pass => pass.isWorldsFirstPP) : null;
+      },
+    },
+    highestAccuracy: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        // If passes are loaded, find the highest accuracy
+        if (this.passes && this.passes.length > 0) {
+          const validPasses = this.passes.filter(pass =>
+            pass.accuracy !== null &&
+            !pass.isDeleted &&
+            !pass.isHidden
+          );
+
+          if (validPasses.length > 0) {
+            return Math.max(...validPasses.map(pass => pass.accuracy || 0));
+          }
+        }
+        return null;
+      }
+    },
+    charter: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.levelCredits?.filter(credit => credit.role === 'charter').map(credit => credit.creator?.name).join(', ');
+      },
+    },
+    charters: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.levelCredits?.filter(credit => credit.role === 'charter').map(credit => credit.creator?.name);
+      },
+    },
+    vfxer: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.levelCredits?.filter(credit => credit.role === 'vfxer').map(credit => credit.creator?.name).join(', ');
+      },
+    },
+    vfxers: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.levelCredits?.filter(credit => credit.role === 'vfxer').map(credit => credit.creator?.name);
+      },
+    },
+    team: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return this.teamObject?.name;
+      },
+    }
+  },
+  {
+    sequelize,
+    tableName: 'levels',
+    indexes: [
+      {fields: [{name: 'song', length: 255}]},
+      {fields: [{name: 'artist', length: 255}]},
+      {name: 'idx_levels_file_id', fields: ['fileId']},
+    ],
+  },
+);
+
+export default Level;

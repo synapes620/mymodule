@@ -1,0 +1,267 @@
+import {DataTypes} from 'sequelize';
+import BaseModel from '@/models/BaseModel.js';
+import Player from '@/models/players/Player.js';
+import Level from '@/models/levels/Level.js';
+import { calcAcc } from '@/misc/utils/pass/CalcAcc.js';
+import User from '@/models/auth/User.js';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+const sequelize = getSequelizeForModelGroup('submissions');
+
+class PassSubmission extends BaseModel {
+  declare passer: string;
+  declare passerId: number | null;
+  declare passerRequest: boolean;
+  declare videoLink: string;
+  declare status: 'pending' | 'approved' | 'declined';
+  declare isLocked: boolean;
+  declare assignedPlayerId: number | null;
+  declare levelId: number;
+  declare speed: number | null;
+  declare is12K: boolean;
+  declare is16K: boolean;
+  declare isNoHoldTap: boolean;
+  declare isWorldsFirst: boolean;
+  declare accuracy: number | null;
+  declare scoreV2: number | null;
+  declare feelingDifficulty: string | null;
+  declare expectedDifficulty: string | null;
+  declare keyCount: number | null;
+  declare title: string | null;
+  declare rawTime: Date | null;
+  declare userId: string | null;
+  // Virtual fields from associations
+  declare assignedPlayer?: Player;
+  declare passerPlayer?: Player;
+  declare level?: Level;
+  declare judgements?: PassSubmissionJudgements;
+  declare flags?: PassSubmissionFlags;
+  declare passSubmitter?: User;
+}
+
+class PassSubmissionJudgements extends BaseModel {
+  declare passSubmissionId: number;
+  declare earlyDouble: number;
+  declare earlySingle: number;
+  declare ePerfect: number;
+  declare perfect: number;
+  declare lPerfect: number;
+  declare lateSingle: number;
+  declare lateDouble: number;
+  declare accuracy?: number;
+}
+
+class PassSubmissionFlags extends BaseModel {
+  declare passSubmissionId: number;
+  declare is12K: boolean;
+  declare isNoHoldTap: boolean;
+  declare is16K: boolean;
+  declare isAdofaiV2: boolean;
+}
+
+PassSubmission.init(
+  {
+    passer: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+    },
+    passerId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'players',
+        key: 'id',
+      },
+    },
+    passerRequest: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    videoLink: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+    },
+    status: {
+      type: DataTypes.ENUM('pending', 'approved', 'declined'),
+      defaultValue: 'pending',
+    },
+    isLocked: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    assignedPlayerId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'players',
+        key: 'id',
+      },
+    },
+    levelId: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: {
+        model: 'levels',
+        key: 'id',
+      },
+    },
+    speed: {
+      type: DataTypes.FLOAT,
+      allowNull: true,
+    },
+    is12K: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    is16K: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    isNoHoldTap: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    isWorldsFirst: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    scoreV2: {
+      type: DataTypes.FLOAT,
+      allowNull: true,
+    },
+    feelingDifficulty: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    expectedDifficulty: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    keyCount: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    title: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    rawTime: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    userId: {
+      type: DataTypes.UUID,
+      allowNull: true,
+      references: {
+        model: 'users',
+        key: 'id',
+      },
+    },
+  },
+  {
+    sequelize,
+    tableName: 'pass_submissions',
+    indexes: [
+      {fields: ['passer']},
+      {fields: ['passerId']},
+      {fields: ['videoLink']},
+      {fields: ['status']},
+      {fields: ['assignedPlayerId']},
+      {fields: ['levelId']},
+      {fields: ['userId']},
+      {fields: ['userId', 'createdAt']},
+    ],
+  },
+);
+
+PassSubmissionJudgements.init(
+  {
+    passSubmissionId: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      references: {
+        model: 'pass_submissions',
+        key: 'id',
+      },
+    },
+    earlyDouble: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    earlySingle: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    ePerfect: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    perfect: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    lPerfect: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    lateSingle: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    lateDouble: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    accuracy: {
+      type: DataTypes.VIRTUAL,
+      get() {
+        return calcAcc(this);
+      },
+    },
+  },
+  {
+    sequelize,
+    tableName: 'pass_submission_judgements',
+  },
+);
+
+PassSubmissionFlags.init(
+  {
+    passSubmissionId: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      references: {
+        model: 'pass_submissions',
+        key: 'id',
+      },
+    },
+    is12K: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    isNoHoldTap: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    is16K: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    isAdofaiV2: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+  },
+  {
+    sequelize,
+    tableName: 'pass_submission_flags',
+  },
+);
+
+PassSubmission.belongsTo(User, {
+  foreignKey: 'userId',
+  as: 'passSubmitter',
+});
+
+export {PassSubmission, PassSubmissionJudgements, PassSubmissionFlags};

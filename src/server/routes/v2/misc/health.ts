@@ -1,0 +1,124 @@
+import express, { Request, Response, Router } from 'express';
+import sequelize from '@/config/db.js';
+import { getIO } from '@/misc/utils/server/socket.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import { healthCheckResponseSchema, healthErrorResponseSchema } from '@/server/schemas/health.js';
+import {
+  getHealthLatencyHistory,
+  parseLatencyWindow,
+} from '@/server/services/health/healthLatencyHistoryService.js';
+
+const router: Router = express.Router();
+
+router.get('/latency', async (req: Request, res: Response) => {
+  const window = parseLatencyWindow(req.query.window);
+  if (!window) {
+    return res.status(400).json({
+      error: 'Invalid or missing window',
+      valid: ['1h', '3h', '6h', '12h', '24h', '3d', '7d', '14d'],
+    });
+  }
+
+  try {
+    const payload = await getHealthLatencyHistory(window);
+    return res.status(200).json(payload);
+  } catch (error) {
+    logger.error('GET /v2/health/latency failed:', error);
+    return res.status(500).json({ error: 'Failed to load latency history' });
+  }
+});
+
+/**
+ * Health check endpoint
+ * Returns the status of various system components
+ */
+router.get(
+  '/',
+  ApiDoc({
+    operationId: 'getHealth',
+    summary: 'Health check',
+    description: 'Returns status of database, socket server, and basic system info',
+    tags: ['Health'],
+    responses: {
+      200: { description: 'Service status and checks', schema: healthCheckResponseSchema },
+      500: { description: 'Service offline or error', schema: healthErrorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    // Check database connection
+    const dbStatus = await checkDatabase();
+
+    // Check socket server
+    const socketStatus = checkSocketServer();
+
+    // Get system information
+    const systemInfo = {
+      uptime: process.uptime(),
+      nodeVersion: process.version,
+      platform: process.platform,
+      env: process.env.NODE_ENV || 'development'
+    };
+
+    // Determine overall health status
+    const isonline = dbStatus.connected && socketStatus.connected;
+    const status = isonline ? 'online' : 'degraded';
+
+    // Return health information
+    res.status(200).json({
+      status,
+      timestamp: new Date().toISOString(),
+      checks: {
+        database: dbStatus,
+        socket: socketStatus
+      },
+      system: systemInfo
+    });
+  } catch (error) {
+    logger.error('Health check failed:', error);
+    res.status(500).json({
+      status: 'offline',
+      timestamp: new Date().toISOString(),
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+/**
+ * Check database connection
+ */
+async function checkDatabase() {
+  try {
+    await sequelize.authenticate();
+    return {
+      connected: true,
+      message: 'Database connection successful'
+    };
+  } catch (error) {
+    return {
+      connected: false,
+      message: error instanceof Error ? error.message : 'Database connection failed'
+    };
+  }
+}
+
+/**
+ * Check socket server status
+ */
+function checkSocketServer() {
+  try {
+    const io = getIO();
+    return {
+      connected: io !== null,
+      message: io !== null ? 'Socket server is running' : 'Socket server is not initialized'
+    };
+  } catch (error) {
+    return {
+      connected: false,
+      message: error instanceof Error ? error.message : 'Socket server check failed'
+    };
+  }
+}
+
+export default router;

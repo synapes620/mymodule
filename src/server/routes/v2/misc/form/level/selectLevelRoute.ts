@@ -1,0 +1,218 @@
+import express, { Router, type Request, type Response } from 'express';
+
+import LevelSubmission from '@/models/submissions/LevelSubmission.js';
+import LevelSubmissionSongRequest from '@/models/submissions/LevelSubmissionSongRequest.js';
+import Song from '@/models/songs/Song.js';
+import cdnService, { CdnError } from '@/server/services/core/CdnService.js';
+import { isYsmodOnlyState } from '@/server/submissions/submissionEvidenceRules.js';
+import { Auth } from '@/server/middleware/auth.js';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import {
+  errorResponseSchema,
+  standardErrorResponses500,
+} from '@/server/schemas/v2/misc/index.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import {
+  matchLevelFileBySelection,
+} from '@/externalServices/cdnService/domain/level/matchLevelFileSelection.js';
+
+const router: Router = Router();
+
+/**
+ * Lets the client pick a specific `.adofai` from a multi-chart zip after
+ * `POST /level/submit` returns `requiresLevelSelection: true`. Logic was moved
+ * verbatim from the old `/v2/form/select-level` endpoint.
+ */
+router.post(
+  '/select-level',
+  Auth.verified(),
+  express.json(),
+  ApiDoc({
+    operationId: 'postFormLevelSelectLevel',
+    summary: 'Select level chart for submission',
+    description: 'Link a selected chart from a multi-chart zip to a submission.',
+    tags: ['Form'],
+    security: ['bearerAuth'],
+    requestBody: {
+      description: 'submissionId, selectedLevel',
+      schema: {
+        type: 'object',
+        properties: {
+          submissionId: { type: 'integer' },
+          selectedLevel: { type: 'string' },
+        },
+        required: ['submissionId', 'selectedLevel'],
+      },
+      required: true,
+    },
+    responses: {
+      200: { description: 'OK' },
+      400: { schema: errorResponseSchema },
+      401: { schema: errorResponseSchema },
+      404: { schema: errorResponseSchema },
+      ...standardErrorResponses500,
+    },
+  }),
+  async (req: Request, res: Response) => {
+    const { submissionId, selectedLevel } = req.body;
+
+    if (!submissionId || !selectedLevel) {
+      return res.status(400).json({ success: false, error: 'Missing required parameters' });
+    }
+
+    const parsedSubmissionId = parseInt(submissionId);
+    if (Number.isNaN(parsedSubmissionId) || parsedSubmissionId <= 0) {
+      return res.status(400).json({ success: false, error: 'Invalid submission ID' });
+    }
+
+    if (typeof selectedLevel !== 'string' || selectedLevel.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Invalid selected level' });
+    }
+
+    try {
+      const submission = await LevelSubmission.findOne({
+        where: {
+          id: parsedSubmissionId,
+          userId: req.user?.id,
+          status: 'pending',
+        },
+        include: [
+          {
+            model: LevelSubmissionSongRequest,
+            as: 'songRequest',
+            attributes: ['verificationState'],
+            required: false,
+          },
+        ],
+      });
+
+      if (!submission) {
+        return res.status(404).json({ success: false, error: 'Level submission not found' });
+      }
+
+      if (!submission.directDL || !submission.directDL.includes('/')) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid directDL URL',
+          directDL: submission.directDL,
+        });
+      }
+
+      const urlParts = submission.directDL.split('/');
+      const fileId = urlParts[urlParts.length - 1] || '';
+      if (!fileId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid directDL URL - could not extract file ID',
+          directDL: submission.directDL,
+        });
+      }
+
+      const levelFiles = await cdnService.getLevelFiles(fileId);
+      const selectedFile = matchLevelFileBySelection(
+        levelFiles.map((file) => ({
+          ...file,
+          path: file.storagePath || file.fullPath,
+          relativePath: file.relativePath || file.fullPath,
+        })),
+        selectedLevel,
+      );
+
+      if (!selectedFile) {
+        logger.error('Selected level file not found:', {
+          fileId,
+          selectedLevel,
+          availableFiles: levelFiles.map((f) => f.fullPath || f.relativePath || f.name),
+          timestamp: new Date().toISOString(),
+        });
+        return res.status(400).json({
+          success: false,
+          error: 'Selected level file not found',
+          availableFiles: levelFiles.map((f) => f.fullPath || f.relativePath || f.name),
+        });
+      }
+
+      if (!selectedFile.hasYouTubeStream) {
+        let songVerificationState: string | null | undefined;
+        if (submission.songId != null) {
+          const song = await Song.findByPk(submission.songId, { attributes: ['verificationState'] });
+          songVerificationState = song?.verificationState;
+        } else {
+          songVerificationState = submission.songRequest?.verificationState;
+        }
+        if (isYsmodOnlyState(songVerificationState)) {
+          return res.status(400).json({
+            success: false,
+            error: 'This song is YSMod-only: the selected chart must require the YouTubeStream mod',
+          });
+        }
+      }
+
+      // Prefer relative path so CDN matching never falls back to ambiguous basenames.
+      const resolvedSelection =
+        selectedFile.relativePath ||
+        selectedFile.fullPath ||
+        selectedFile.storagePath ||
+        selectedLevel;
+      await cdnService.setTargetLevel(fileId, resolvedSelection);
+
+      return res.json({
+        success: true,
+        selectedFile: {
+          name: selectedFile.name,
+          size: selectedFile.size,
+          hasYouTubeStream: selectedFile.hasYouTubeStream,
+          songFilename: selectedFile.songFilename,
+          artist: selectedFile.artist,
+          song: selectedFile.song,
+          author: selectedFile.author,
+          difficulty: selectedFile.difficulty,
+          bpm: selectedFile.bpm,
+        },
+      });
+    } catch (error) {
+      if (error instanceof CdnError) {
+        const status = error.httpStatus;
+        if (status >= 500) {
+          logger.error('Failed to process level selection:', {
+            error: { message: error.message, stack: error.stack, code: error.code, details: error.details },
+            submissionId: parsedSubmissionId,
+            selectedLevel,
+            userId: req.user?.id,
+            timestamp: new Date().toISOString(),
+          });
+        } else {
+          logger.warn('Level selection rejected by CDN:', {
+            error: error.message,
+            code: error.code,
+            status,
+            submissionId: parsedSubmissionId,
+            selectedLevel,
+            userId: req.user?.id,
+          });
+        }
+        return res.status(status).json({
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        });
+      }
+
+      logger.error('Failed to process level selection:', {
+        error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+        submissionId: parsedSubmissionId,
+        selectedLevel,
+        userId: req.user?.id,
+        timestamp: new Date().toISOString(),
+      });
+
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to process level selection',
+      });
+    }
+  },
+);
+
+export default router;

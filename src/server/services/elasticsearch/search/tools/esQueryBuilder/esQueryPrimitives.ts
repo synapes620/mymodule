@@ -1,0 +1,121 @@
+/**
+ * Small compositional helpers for Elasticsearch query DSL.
+ * Keeps leaf shapes identical to hand-written JSON so behavior stays stable.
+ */
+export type EsQuery = Record<string, unknown>;
+
+export function boolMust(must: EsQuery[]): EsQuery {
+  return { bool: { must } };
+}
+
+export function boolShould(minimumShouldMatch: number, should: EsQuery[]): EsQuery {
+  return { bool: { should, minimum_should_match: minimumShouldMatch } };
+}
+
+/** `should` only — omits `minimum_should_match` to match legacy DSL where ES defaults apply. */
+export function boolShouldOnly(should: EsQuery[]): EsQuery {
+  return { bool: { should } };
+}
+
+export function boolMustNot(mustNot: EsQuery[]): EsQuery {
+  return { bool: { must_not: mustNot } };
+}
+
+export function boolFilter(filter: EsQuery[]): EsQuery {
+  return { bool: { filter } };
+}
+
+/**
+ * Wraps `query` in a nested query. When `ignoreUnmapped` is true, adds ignore_unmapped (for optional nested mappings).
+ */
+export function nestedQuery(path: string, query: EsQuery, ignoreUnmapped = false): EsQuery {
+  const nested: Record<string, unknown> = { path, query };
+  if (ignoreUnmapped) {
+    nested.ignore_unmapped = true;
+  }
+  return { nested };
+}
+
+export function wildcardCi(field: string, value: string): EsQuery {
+  return {
+    wildcard: {
+      [field]: {
+        value,
+        case_insensitive: true,
+      },
+    },
+  };
+}
+
+export function termField(field: string, value: string | number | boolean, caseInsensitive?: boolean): EsQuery {
+  if (caseInsensitive) {
+    return {
+      term: {
+        [field]: {
+          value,
+          case_insensitive: true,
+        },
+      },
+    };
+  }
+  return { term: { [field]: value } };
+}
+
+export function existsField(field: string): EsQuery {
+  return { exists: { field } };
+}
+
+export function termsField(field: string, values: (string | number)[]): EsQuery {
+  return { terms: { [field]: values } };
+}
+
+/** Match documents by Elasticsearch `_id` (level docs are keyed as stringified numeric ids). */
+export function idsQuery(values: (string | number)[]): EsQuery {
+  return { ids: { values: values.map((v) => String(v)) } };
+}
+
+export function rangeGt(field: string, gt: number): EsQuery {
+  return { range: { [field]: { gt } } };
+}
+
+/** Partial range on a numeric field (gt/gte/lt/lte — include only keys you need). */
+export function rangeOnField(
+  field: string,
+  bounds: Partial<{ gt: number; gte: number; lt: number; lte: number }>,
+): EsQuery {
+  return { range: { [field]: bounds } };
+}
+
+export function wrapMustNot(q: EsQuery): EsQuery {
+  return { bool: { must_not: [q] } };
+}
+
+export function maybeNot(isNot: boolean, q: EsQuery): EsQuery {
+  return isNot ? wrapMustNot(q) : q;
+}
+
+export function matchNone(): EsQuery {
+  return { bool: { must_not: [{ match_all: {} }] } };
+}
+
+/**
+ * Restrict a filter clause to document `id` values.
+ * Empty include matches nothing; empty exclude is a no-op; omitted `ids` leaves the filter unchanged.
+ */
+export function applyIdsFilter(
+  filter: EsQuery[],
+  ids: number[] | undefined,
+  mode: 'include' | 'exclude' = 'include',
+): void {
+  if (ids == null) return;
+  if (mode === 'exclude') {
+    if (ids.length === 0) return;
+    filter.push(wrapMustNot(termsField('id', ids)));
+    return;
+  }
+  if (ids.length === 0) {
+    filter.push(matchNone());
+    return;
+  }
+  filter.push(termsField('id', ids));
+}

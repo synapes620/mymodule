@@ -1,0 +1,62 @@
+import {Model, DataTypes} from 'sequelize';
+import {IAnnouncementChannel} from '@/server/interfaces/models/index.js';
+import { now } from 'sequelize/lib/utils';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+const sequelize = getSequelizeForModelGroup('announcements');
+
+class AnnouncementChannel extends Model<IAnnouncementChannel> implements IAnnouncementChannel {
+  declare id: number;
+  declare label: string;
+  declare webhookUrl: string;
+  declare isActive: boolean;
+  declare createdAt: Date;
+  declare updatedAt: Date;
+}
+
+AnnouncementChannel.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+      allowNull: false,
+    },
+    label: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    webhookUrl: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    isActive: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: now
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: now
+    },
+  },
+  {
+    sequelize,
+    tableName: 'announcement_channels',
+    indexes: [
+      {
+        fields: ['isActive'],
+      },
+      {
+        fields: ['label'],
+      },
+    ],
+  },
+);
+
+export default AnnouncementChannel;

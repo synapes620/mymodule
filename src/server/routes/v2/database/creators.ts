@@ -1,0 +1,1592 @@
+import {Op} from 'sequelize';
+import {Auth} from '@/server/middleware/auth.js';
+import {ApiDoc} from '@/server/middleware/apiDoc.js';
+import { standardErrorResponses, standardErrorResponses404500, standardErrorResponses500, idParamSpec, errorResponseSchema } from '@/server/schemas/v2/database/index.js';
+import Creator from '@/models/credits/Creator.js';
+import Level from '@/models/levels/Level.js';
+import LevelCredit from '@/models/levels/LevelCredit.js';
+import {CreditRole} from '@/models/levels/LevelCredit.js';
+import sequelize from '@/config/db.js';
+import User from '@/models/auth/User.js';
+import {
+  escapeForMySQL,
+} from '@/misc/utils/data/searchHelpers.js';
+import {Router, Request, Response} from 'express';
+import LevelSubmissionCreatorRequest from '@/models/submissions/LevelSubmissionCreatorRequest.js';
+import { CreatorAlias } from '@/models/credits/CreatorAlias.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import ElasticsearchService from '@/server/services/elasticsearch/ElasticsearchService.js';
+import { safeTransactionRollback } from '@/misc/utils/Utility.js';
+import { remapFollowTargets } from '@/server/services/notifications/FollowService.js';
+import { mapMysqlClientError } from '@/misc/utils/db/mysqlClientError.js';
+import { PaginationQuery } from '@/server/interfaces/models/index.js';
+import { validCreatorVerificationStatuses, type CreatorVerificationStatus } from '@/config/constants.js';
+import {appendCreatorAliasFromRename} from '@/server/services/aliases/nameChangeAliases.js';
+import TournamentPlacement from '@/models/tournaments/TournamentPlacement.js';
+import TournamentPlacementCredit from '@/models/tournaments/TournamentPlacementCredit.js';
+import {
+  clearLevelTeam,
+  createTeam,
+  deleteTeam,
+  listTeams,
+  loadTeamFlat,
+  searchTeams,
+  setLevelTeam,
+  TeamMutationError,
+  updateTeam,
+} from '@/server/services/teams/teamMutations.js';
+
+const elasticsearchService = ElasticsearchService.getInstance();
+const router: Router = Router();
+
+function handleTeamMutationError(res: Response, error: unknown, fallback: string) {
+  if (error instanceof TeamMutationError) {
+    return res.status(error.status).json({error: error.message, ...error.extra});
+  }
+  logger.error(fallback, error);
+  return res.status(500).json({error: fallback});
+}
+
+interface LevelCountResult {
+  creatorId: number;
+  count: string;
+}
+
+// Get all creators with their aliases and level counts
+router.get(
+  '/',
+  ApiDoc({
+    operationId: 'getCreators',
+    summary: 'List creators',
+    description: 'Paginated creators with search. Query: page, offset, limit, search, verificationStatus, excludeAliases, sort.',
+    tags: ['Database', 'Creators'],
+    query: { page: { schema: { type: 'string' } }, offset: { schema: { type: 'string' } }, limit: { schema: { type: 'string' } }, search: { schema: { type: 'string' } }, verificationStatus: { schema: { type: 'string' } }, excludeAliases: { schema: { type: 'string' } }, sort: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Creators list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const { page, limit, offset } = req.query as unknown as PaginationQuery;
+      const {
+        search = '',
+        verificationStatus,
+        excludeAliases = 'false',
+        sort = 'NAME_ASC',
+      } = req.query;
+
+      const startTime = Date.now();
+      const where: any = {};
+      if (typeof verificationStatus === 'string' && verificationStatus.length > 0) {
+        const requested = verificationStatus
+          .split(',')
+          .map(s => s.trim())
+          .filter(s => (validCreatorVerificationStatuses as readonly string[]).includes(s));
+        if (requested.length === 1) {
+          where.verificationStatus = requested[0];
+        } else if (requested.length > 1) {
+          where.verificationStatus = { [Op.in]: requested };
+        }
+      }
+
+      const escapedSearch = escapeForMySQL(search as string);
+      // Build order clause
+      let order: any[] = [['name', 'ASC']]; // default sorting
+      switch (sort) {
+        case 'NAME_DESC':
+          order = [['name', 'DESC']];
+          break;
+        case 'ID_ASC':
+          order = [['id', 'ASC']];
+          break;
+        case 'ID_DESC':
+          order = [['id', 'DESC']];
+          break;
+        case 'CHARTS_ASC':
+          order = [
+            [
+              sequelize.literal(
+                '(SELECT COUNT(*) FROM level_credits WHERE level_credits.creatorId = Creator.id AND level_credits.role IN (\'charter\', \'vfxer\'))',
+              ),
+              'ASC',
+            ],
+          ];
+          break;
+        case 'CHARTS_DESC':
+          order = [
+            [
+              sequelize.literal(
+                '(SELECT COUNT(*) FROM level_credits WHERE level_credits.creatorId = Creator.id AND level_credits.role IN (\'charter\', \'vfxer\'))',
+              ),
+              'DESC',
+            ],
+          ];
+          break;
+      }
+
+      const creatorsByName = await Creator.findAll({
+        where: {name: {[Op.like]: `%${escapedSearch}%`}},
+        attributes: ['id'],
+      });
+
+      const creatorIds: Set<number> = new Set(creatorsByName.map(creator => creator.id));
+
+      if (excludeAliases !== 'true') {
+        const creatorsByAlias = await CreatorAlias.findAll({
+          where: {name: {[Op.like]: `%${escapedSearch}%`}},
+          attributes: ['creatorId'],
+        });
+        creatorsByAlias.forEach(alias => creatorIds.add(alias.creatorId));
+      }
+
+      logger.debug(`Total by id for ${escapedSearch}: ${creatorIds.size}`);
+      // Then get paginated results
+      const {rows: creators, count: totalCount} = await Creator.findAndCountAll({
+        where: {...where, id: {[Op.in]: Array.from(creatorIds)}},
+        include: [
+          {
+            model: User,
+            as: 'user',
+            attributes: ['id', 'username', 'avatarUrl'],
+          },
+          {
+            model: User,
+            as: 'linkedUser',
+            attributes: ['id', 'username', 'avatarUrl'],
+          },
+          {
+            model: LevelCredit,
+            as: 'credits',
+            attributes: ['id', 'role'],
+          },
+          {
+            model: CreatorAlias,
+            as: 'creatorAliases',
+            attributes: ['id', 'name'],
+          },
+        ],
+        order,
+        offset,
+        limit,
+      });
+
+      const delay = Date.now() - startTime
+      if (delay > 400) {
+        logger.debug(`creators filter took ${delay}ms with ${creators.length} creators`);
+      }
+
+      // `user` (creators.userId) and `linkedUser` (users.creatorId) are two link columns that
+      // can drift apart. Normalize to a single `user` field, preferring the authoritative
+      // `users.creatorId` side so the UI reliably knows a creator is already assigned.
+      const results = creators.map((creator) => {
+        const plain = creator.get({ plain: true });
+        plain.user = plain.linkedUser || plain.user || null;
+        delete plain.linkedUser;
+        return plain;
+      });
+
+      return res.json({
+        count: totalCount,
+        results,
+        page,
+        offset,
+        limit,
+      });
+    } catch (error) {
+      logger.error('Error fetching creators:', error);
+      return res.status(500).json({error: 'Failed to fetch creators'});
+    }
+  }
+);
+
+router.get(
+  '/byId/:creatorId([0-9]{1,20})',
+  ApiDoc({
+    operationId: 'getCreatorById',
+    summary: 'Get creator by ID',
+    description: 'Get creator with credits and aliases.',
+    tags: ['Database', 'Creators'],
+    params: { creatorId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Creator' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const {creatorId} = req.params;
+    const creator = await Creator.findByPk(creatorId, {
+      include: [
+        {
+          model: User,
+          as: 'user',
+          attributes: ['id', 'username', 'avatarUrl'],
+        },
+        {
+          model: User,
+          as: 'linkedUser',
+          attributes: ['id', 'username', 'avatarUrl'],
+        },
+        {
+          model: LevelCredit,
+          as: 'credits',
+          attributes: ['id', 'role', 'levelId'],
+        },
+        {
+          model: CreatorAlias,
+          as: 'creatorAliases',
+          attributes: ['id', 'name'],
+        }
+      ],
+    });
+
+    if (!creator) {
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    const plain = creator.get({ plain: true });
+    plain.user = plain.linkedUser || plain.user || null;
+    delete plain.linkedUser;
+    return res.json(plain);
+  } catch (error) {
+    logger.error('Error fetching creator:', error);
+    return res.status(500).json({ error: 'Failed to fetch creator details' });
+  }
+});
+
+// Get team by ID with members and levels
+// Prefer GET /v3/teams/:id?includeLevels=true
+router.get(
+  '/teams/byId/:teamId([0-9]{1,20})',
+  ApiDoc({
+    operationId: 'getTeamById',
+    summary: 'Get team by ID',
+    description:
+      'Get team with members, levels, and aliases. Prefer GET /v3/teams/:id?includeLevels=true.',
+    tags: ['Database', 'Creators'],
+    params: { teamId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Team' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const teamId = parseInt(req.params.teamId, 10);
+    const formattedTeam = await loadTeamFlat(teamId, {includeLevels: true});
+    if (!formattedTeam) {
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    return res.json(formattedTeam);
+  } catch (error) {
+    logger.error('Error fetching team:', error);
+    return res.status(500).json({ error: 'Failed to fetch team details' });
+  }
+  }
+);
+
+// Get levels with their legacy and current creators
+router.get(
+  '/levels-audit',
+  ApiDoc({
+    operationId: 'getCreatorsLevelsAudit',
+    summary: 'Levels audit',
+    description: 'Paginated levels with creator/team audit. Query: page, offset, limit, search, excludeAliases.',
+    tags: ['Database', 'Creators'],
+    query: { page: { schema: { type: 'string' } }, offset: { schema: { type: 'string' } }, limit: { schema: { type: 'string' } }, search: { schema: { type: 'string' } }, excludeAliases: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Audit results' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      const { page, offset, limit } = req.query as unknown as PaginationQuery;
+      const {
+        search: searchQuery,
+        excludeAliases,
+      } = req.query;
+
+      const search =
+        typeof searchQuery === 'string' ? searchQuery.trim() : '';
+
+      // Use ElasticsearchService to search levels
+      const { hits, total } = await elasticsearchService.searchLevels(search, {
+        offset,
+        limit,
+        excludeAliases
+      });
+      // Get level counts for creators
+      const levelCounts = (await LevelCredit.findAll({
+        where: {
+          levelId: {
+            [Op.in]: hits.map(level => level.id)
+          }
+        },
+        attributes: [
+          'creatorId',
+          [sequelize.fn('COUNT', sequelize.col('levelId')), 'count'],
+        ],
+        group: ['creatorId'],
+        raw: true,
+      })) as unknown as LevelCountResult[];
+
+      const levelCountMap = new Map(
+        levelCounts.map(count => [count.creatorId, parseInt(count.count)]),
+      );
+
+      // Format the response
+      const audit = hits.map(level => ({
+        id: level.id,
+        song: level.song,
+        artist: level.artist,
+        legacyCreator: '[LEGACY CREATOR DISABLED]',
+        teamId: level.teamId,
+        team: level.teamObject
+          ? {
+              id: level.teamObject.id,
+              name: level.teamObject.name,
+              description: level.teamObject.description,
+              members: level.teamObject.members,
+              aliases: level.teamObject.aliases || []
+            }
+          : null,
+        currentCreators: level.levelCredits?.map((credit: {
+          creator: {
+            id: number;
+            name: string;
+            creatorAliases?: { name: string }[]
+          };
+          role: CreditRole;
+          isOwner: boolean;
+        }) => ({
+          id: credit.creator.id,
+          name: credit.creator.name,
+          role: credit.role,
+          isOwner: credit.isOwner,
+          aliases: credit.creator.creatorAliases?.map((alias: { name: string }) => alias.name) || [],
+          levelCount: levelCountMap.get(credit.creator.id) || 0,
+        })) || [],
+      }));
+
+      return res.json({
+        count: total,
+        results: audit,
+        page,
+        offset,
+        limit,
+      });
+    } catch (error) {
+      logger.error('Error fetching levels audit:', error);
+      return res.status(500).json({error: 'Failed to fetch levels audit'});
+    }
+  }
+);
+
+// Create new creator
+router.post(
+  '/',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postCreator',
+    summary: 'Create creator',
+    description: 'Create a creator. Body: name, aliases?.',
+    tags: ['Database', 'Creators'],
+    requestBody: { description: 'name, aliases', schema: { type: 'object', properties: { name: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } } }, required: ['name'] }, required: true },
+    responses: { 200: { description: 'Creator created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const { name, aliases = [] } = req.body;
+
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({ error: 'Creator name is required' });
+    }
+
+    // Create the creator
+    const creator = await Creator.create({
+      name: name.trim(),
+      verificationStatus: 'pending'
+    }, { transaction });
+
+    // Create aliases if provided
+    if (aliases && Array.isArray(aliases) && aliases.length > 0) {
+      const aliasRecords = aliases.map((alias: string) => ({
+        creatorId: creator.id,
+        name: alias.trim(),
+      }));
+
+      await CreatorAlias.bulkCreate(aliasRecords, { transaction });
+    }
+
+    // Fetch the creator with its aliases to return
+    const creatorWithAliases = await Creator.findByPk(creator.id, {
+      include: [
+        {
+          model: CreatorAlias,
+          as: 'creatorAliases',
+          attributes: ['id', 'name'],
+        }
+      ],
+      transaction
+    });
+
+    await transaction.commit();
+    return res.json(creatorWithAliases);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error creating creator:', error);
+    return res.status(500).json({ error: 'Failed to create creator' });
+  }
+  }
+);
+
+// Update level creators
+router.put(
+  '/level/:levelId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putLevelCreators',
+    summary: 'Update level creators',
+    description: 'Replace creators for a level. Body: creators[{ id, role, isOwner }]. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { levelId: { schema: { type: 'string' } } },
+    requestBody: { description: 'creators', schema: { type: 'object', properties: { creators: { type: 'array', items: { type: 'object', properties: { id: { type: 'number' }, role: { type: 'string' }, isOwner: { type: 'boolean' } } } } } }, required: true },
+    responses: { 200: { description: 'Level creators updated' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const {levelId} = req.params;
+      const {creators} = req.body;
+
+      // Validate level exists
+      const level = await Level.findByPk(levelId, {transaction});
+      if (!level) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'Level not found'});
+      }
+
+      // Remove existing credits
+      await LevelCredit.destroy({
+        where: {levelId},
+        transaction,
+      });
+
+      // Add new credits
+      if (creators && creators.length > 0) {
+        await LevelCredit.bulkCreate(
+          creators.map((c: {id: number; role: CreditRole; isOwner: boolean}, index: number) => ({
+            levelId,
+            creatorId: c.id,
+            isOwner: c.isOwner,
+            role: c.role,
+            sortOrder: index,
+          })),
+          {transaction},
+        );
+      }
+
+      await transaction.commit();
+
+      // Wait for indexing to complete
+      await elasticsearchService.indexLevel(parseInt(levelId));
+
+      return res.json({message: 'Level creators updated successfully'});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      logger.error('Error updating level creators:', error);
+      return res.status(500).json({error: 'Failed to update level creators'});
+    }
+  }
+);
+
+// Merge creators
+router.post(
+  '/merge',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postCreatorsMerge',
+    summary: 'Merge creators',
+    description: 'Merge source creator into target. Body: sourceId, targetId. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'sourceId, targetId', schema: { type: 'object', properties: { sourceId: { type: 'number' }, targetId: { type: 'number' } }, required: ['sourceId', 'targetId'] }, required: true },
+    responses: { 200: { description: 'Merge success' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      const {sourceId, targetId} = req.body;
+      const parsedSourceId = Number(sourceId);
+      const parsedTargetId = Number(targetId);
+
+      if (
+        !Number.isInteger(parsedSourceId) ||
+        parsedSourceId <= 0 ||
+        !Number.isInteger(parsedTargetId) ||
+        parsedTargetId <= 0
+      ) {
+        return res.status(400).json({error: 'Invalid source or target ID'});
+      }
+      if (parsedSourceId === parsedTargetId) {
+        return res.status(400).json({error: 'Cannot merge a creator into itself'});
+      }
+
+      transaction = await sequelize.transaction();
+
+      // Get source and target creators
+      const sourceCreator = await Creator.findByPk(sourceId, {
+        include: [
+          {
+            model: CreatorAlias,
+            as: 'creatorAliases',
+            attributes: ['id', 'name'],
+          }
+        ],
+        transaction
+      });
+      const targetCreator = await Creator.findByPk(targetId, {
+        include: [
+          {
+            model: CreatorAlias,
+            as: 'creatorAliases',
+            attributes: ['id', 'name'],
+          }
+        ],
+        transaction
+      });
+      if (!sourceCreator || !targetCreator) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'Creator not found'});
+      }
+
+      // Get all level credits for source creator
+      const sourceCredits = await LevelCredit.findAll({
+        where: {creatorId: sourceId},
+        transaction,
+      });
+
+      // Transfer credits to target creator
+      for (const credit of sourceCredits) {
+        await LevelCredit.upsert(
+          {
+            levelId: credit.levelId,
+            creatorId: targetId,
+            role: credit.role,
+          },
+          {transaction},
+        );
+      }
+
+      // Update LevelSubmissionCreatorRequest records
+      await LevelSubmissionCreatorRequest.update(
+        { creatorId: targetId },
+        { where: { creatorId: sourceId }, transaction }
+      );
+
+      // Delete all source credits after transfer
+      await LevelCredit.destroy({
+        where: {creatorId: sourceId},
+        transaction,
+      });
+
+      // Merge aliases
+      const sourceAliases = sourceCreator.creatorAliases?.map((alias: any) => alias.name) || [];
+      const targetAliases = (targetCreator as any).creatorAliases?.map((alias: any) => alias.name) || [];
+      const mergedAliases = [
+        ...new Set([...targetAliases, ...sourceAliases, sourceCreator.name]),
+      ];
+      const aliasMap = new Map<string, string>();
+      for (const alias of mergedAliases) {
+        const trimmed = alias?.trim();
+        if (!trimmed) continue;
+        const key = trimmed.toLowerCase();
+        if (!aliasMap.has(key)) {
+          aliasMap.set(key, trimmed);
+        }
+      }
+      // Delete existing target aliases
+      await CreatorAlias.destroy({
+        where: { creatorId: targetId },
+        transaction
+      });
+
+      // Create new merged aliases
+      const uniqueAliases = Array.from(aliasMap.values());
+      if (uniqueAliases.length > 0) {
+        const aliasRecords = uniqueAliases.map(alias => ({
+          creatorId: targetId,
+          name: alias,
+        }));
+
+        await CreatorAlias.bulkCreate(aliasRecords, { transaction });
+      }
+
+      // Handle users that reference the source creator
+      // Check if target creator is already assigned to a user
+      const targetCreatorUser = await User.findOne({
+        where: { creatorId: targetId },
+        transaction
+      });
+
+      // Update users that have source creator assigned
+      if (targetCreatorUser) {
+        // Target creator is already assigned to a user, so set source creator references to null
+        await User.update(
+          { creatorId: null },
+          { where: { creatorId: sourceId }, transaction }
+        );
+      } else {
+        // Target creator is not assigned, transfer source creator references to target
+        await User.update(
+          { creatorId: targetId },
+          { where: { creatorId: sourceId }, transaction }
+        );
+        // Also update creator.userId if source creator was linked to a user
+        if (sourceCreator.userId) {
+          await targetCreator.update({ userId: sourceCreator.userId }, { transaction });
+        }
+      }
+
+      // Rewrite tournament placement nominee filters that still reference the source creator
+      const placementsWithSource = await TournamentPlacement.findAll({
+        where: {
+          creditedCreatorIds: {[Op.ne]: null},
+        },
+        transaction,
+      });
+      for (const placement of placementsWithSource) {
+        const ids = Array.isArray(placement.creditedCreatorIds)
+          ? placement.creditedCreatorIds
+          : null;
+        if (!ids?.includes(sourceId)) continue;
+
+        const remapped: number[] = [];
+        const seen = new Set<number>();
+        for (const id of ids) {
+          const nextId = id === sourceId ? targetId : id;
+          if (seen.has(nextId)) continue;
+          seen.add(nextId);
+          remapped.push(nextId);
+        }
+        await placement.update({creditedCreatorIds: remapped}, {transaction});
+      }
+
+      // Remap placement credits from source → target (dedupe if target already credited)
+      const sourcePlacementCredits = await TournamentPlacementCredit.findAll({
+        where: {creatorId: sourceId},
+        transaction,
+      });
+      for (const credit of sourcePlacementCredits) {
+        const existingTarget = await TournamentPlacementCredit.findOne({
+          where: {
+            placementId: credit.placementId,
+            creatorId: targetId,
+          },
+          transaction,
+        });
+        if (existingTarget) {
+          await credit.destroy({transaction});
+        } else {
+          await credit.update({creatorId: targetId}, {transaction});
+        }
+      }
+
+      await remapFollowTargets({
+        targetType: 'creator',
+        sourceId: Number(sourceId),
+        targetId: Number(targetId),
+        transaction,
+      });
+
+      // Delete the source creator
+      await sourceCreator.destroy({transaction});
+
+      await transaction.commit();
+      // Elasticsearch: CDC projectors (creators / creator_aliases / level_credits / users).
+
+      return res.json({success: true});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      logger.error('Error merging creators:', error);
+      return res.status(500).json({error: 'Failed to merge creators'});
+    }
+  }
+);
+
+// Split creator
+router.post(
+  '/split',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postCreatorSplit',
+    summary: 'Split creator',
+    description: 'Split creator into multiple creators. Body: creatorId, newNames[], roles?. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'creatorId, newNames, roles', schema: { type: 'object', properties: { creatorId: { type: 'number' }, newNames: { type: 'array', items: { type: 'string' } }, roles: { type: 'array', items: { type: 'string' } } }, required: ['creatorId', 'newNames'] }, required: true },
+    responses: { 200: { description: 'Creator split' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const {creatorId, newNames, roles} = req.body;
+
+      // Validate source creator exists
+      const source = await Creator.findByPk(creatorId, {
+        include: [
+          {
+            model: LevelCredit,
+            as: 'credits',
+            attributes: ['id', 'role'],
+          },
+          {
+            model: CreatorAlias,
+            as: 'creatorAliases',
+            attributes: ['id', 'name'],
+          }
+        ],
+        transaction,
+      });
+
+      if (!source) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'Creator not found'});
+      }
+
+      // Get all level credits for source creator
+      const sourceCredits = await LevelCredit.findAll({
+        where: {creatorId},
+        transaction,
+      });
+
+      // Determine default role if creator has exactly one level
+      let defaultRole = CreditRole.CHARTER;
+      if (sourceCredits.length === 1) {
+        defaultRole = sourceCredits[0].role;
+      }
+
+      const targetCreators = [];
+      // Process each new name
+      for (let i = 0; i < newNames.length; i++) {
+        const newName = newNames[i];
+        const role = roles?.[i] || defaultRole;
+
+        // Check if creator with the new name already exists
+        let targetCreator = await Creator.findOne({
+          where: {name: newName},
+          transaction,
+        });
+
+        // If no existing creator found, create a new one
+        if (!targetCreator) {
+          targetCreator = await Creator.create(
+            {
+              name: newName,
+            },
+            {transaction},
+          );
+        }
+        targetCreators.push(targetCreator);
+
+        // Create level credits for each target creator
+        for (const credit of sourceCredits) {
+          try {
+            // Try to create the credit, ignore if it already exists
+            await LevelCredit.create(
+              {
+                levelId: credit.levelId,
+                creatorId: targetCreator.id,
+                role: role,
+              },
+              {
+                transaction,
+                ignoreDuplicates: true, // This tells Sequelize to ignore duplicate entries
+              },
+            );
+          } catch (error: any) {
+            // If it's a duplicate entry error, just continue
+            if (mapMysqlClientError(error)?.code === 'ER_DUP_ENTRY') {
+              continue;
+            }
+            throw error; // Re-throw if it's any other type of error
+          }
+        }
+
+        // Create LevelSubmissionCreatorRequest records for each new creator
+        const creatorRequests = await LevelSubmissionCreatorRequest.findAll({
+          where: { creatorId },
+          transaction,
+        });
+
+        for (const request of creatorRequests) {
+          // Update the existing request to point to the new creator instead of creating a new one
+          await LevelSubmissionCreatorRequest.update(
+            {
+              creatorName: newName,
+              creatorId: targetCreator.id,
+              isNewRequest: true,
+            },
+            {
+              where: { id: request.id },
+              transaction
+            }
+          );
+        }
+      }
+
+      // Delete all source credits after transfer
+      await LevelCredit.destroy({
+        where: {creatorId},
+        transaction,
+      });
+
+      // Delete the source creator
+      await source.destroy({transaction});
+
+      await transaction.commit();
+      // Elasticsearch: CDC projectors.
+
+      return res.json({
+        message: 'Creator split successfully',
+        newCreators: targetCreators,
+      });
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      logger.error('Error splitting creator:', error);
+      return res.status(500).json({error: 'Failed to split creator'});
+    }
+  }
+);
+
+// Update creator
+router.put(
+  '/:id([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putCreator',
+    summary: 'Update creator',
+    description: 'Update creator. Body: name?, aliases?, userId?, verificationStatus?.',
+    tags: ['Database', 'Creators'],
+    params: { id: idParamSpec },
+    requestBody: { description: 'name, aliases, userId, verificationStatus', schema: { type: 'object', properties: { name: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } }, userId: { type: 'string' }, verificationStatus: { type: 'string', enum: ['declined','pending','conditional','allowed'] } } }, required: true },
+    responses: { 200: { description: 'Creator updated' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+
+  try {
+    transaction = await sequelize.transaction();
+    const {id} = req.params;
+    const {name, aliases, userId, verificationStatus} = req.body;
+
+    if (
+      verificationStatus !== undefined &&
+      !(validCreatorVerificationStatuses as readonly string[]).includes(verificationStatus)
+    ) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({
+        error: `Invalid verificationStatus. Must be one of: ${validCreatorVerificationStatuses.join(', ')}`,
+      });
+    }
+
+    const creatorId = parseInt(id, 10);
+    const updatePayload: Record<string, unknown> = {};
+    if (name !== undefined) {
+      const creatorRow = await Creator.findByPk(creatorId, {
+        attributes: ['id', 'name'],
+        transaction,
+      });
+      const currentName = String(creatorRow?.name ?? '');
+      const nextName = String(name).trim();
+      if (creatorRow && nextName && nextName !== currentName) {
+        await appendCreatorAliasFromRename(creatorId, currentName, nextName, transaction);
+      }
+      updatePayload.name = name;
+    }
+    if (userId !== undefined) updatePayload.userId = userId;
+    if (verificationStatus !== undefined) {
+      updatePayload.verificationStatus = verificationStatus as CreatorVerificationStatus;
+    }
+
+    if (Object.keys(updatePayload).length > 0) {
+      await Creator.update(updatePayload, {
+        where: {id: creatorId},
+        transaction,
+      });
+    }
+
+    // Update aliases if provided
+    if (aliases && Array.isArray(aliases)) {
+      // Delete existing aliases
+      await CreatorAlias.destroy({
+        where: { creatorId: parseInt(id) },
+        transaction
+      });
+
+      // Create new aliases
+      if (aliases.length > 0) {
+        const aliasRecords = aliases.map((alias: string) => ({
+          creatorId: parseInt(id),
+          name: alias.trim(),
+        }));
+
+        await CreatorAlias.bulkCreate(aliasRecords, { transaction });
+      }
+    }
+
+    await transaction.commit();
+
+    // Get updated creator with associations
+    const updatedCreator = await Creator.findByPk(id, {
+      include: [
+        {
+          model: LevelCredit,
+          as: 'credits',
+          attributes: ['id', 'role'],
+        },
+        {
+          model: User,
+          as: 'user',
+          attributes: ['id', 'username', 'avatarUrl'],
+        },
+        {
+          model: CreatorAlias,
+          as: 'creatorAliases',
+          attributes: ['id', 'name'],
+        }
+      ],
+    });
+    // Elasticsearch: CDC projectors (creators / creator_aliases).
+
+    return res.json(updatedCreator);
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error updating creator:', error);
+    return res.status(500).json({error: 'Failed to update creator'});
+  }
+  }
+);
+
+// Get all teams with search
+// Prefer GET /v3/teams or GET /v3/teams/search
+router.get(
+  '/teams',
+  ApiDoc({
+    operationId: 'getCreatorsTeams',
+    summary: 'List teams',
+    description: 'List teams with optional search. Query: search. Prefer GET /v3/teams.',
+    tags: ['Database', 'Creators'],
+    query: { search: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Teams list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+    const formattedTeams = await listTeams(search);
+    return res.json(formattedTeams);
+  } catch (error) {
+    logger.error('Error fetching teams:', error);
+    return res.status(500).json({error: 'Failed to fetch teams'});
+  }
+  }
+);
+
+// Create or update team for level
+// Prefer PUT /v3/levels/:id/team
+router.put(
+  '/level/:levelId([0-9]+)/team',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putLevelTeam',
+    summary: 'Set level team',
+    description:
+      'Create/update team for level. Body: teamId?, name?, members?. Prefer PUT /v3/levels/:id/team. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { levelId: { schema: { type: 'string' } } },
+    requestBody: { description: 'teamId, name, members', schema: { type: 'object', properties: { teamId: { type: 'number' }, name: { type: 'string' }, members: { type: 'array', items: { type: 'number' } } } }, required: true },
+    responses: { 200: { description: 'Team updated' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+      transaction = await sequelize.transaction();
+      const levelId = parseInt(req.params.levelId, 10);
+      const updatedTeam = await setLevelTeam(
+        levelId,
+        {
+          teamId: req.body?.teamId,
+          name: req.body?.name,
+          members: req.body?.members,
+        },
+        transaction,
+      );
+      await transaction.commit();
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      elasticsearchService.indexLevel(levelId);
+      return res.json({
+        message: 'Team updated successfully',
+        team: updatedTeam,
+      });
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      return handleTeamMutationError(res, error, 'Failed to update team');
+    }
+  }
+);
+
+// Delete team association from level
+// Prefer DELETE /v3/levels/:id/team
+router.delete(
+  '/level/:levelId([0-9]{1,20})/team',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteLevelTeam',
+    summary: 'Remove level team',
+    description:
+      'Remove team association from level. Prefer DELETE /v3/levels/:id/team. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { levelId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Team removed' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const levelId = parseInt(req.params.levelId, 10);
+      await clearLevelTeam(levelId, transaction);
+      await transaction.commit();
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      elasticsearchService.indexLevel(levelId);
+      return res.json({message: 'Team association removed successfully'});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      return handleTeamMutationError(res, error, 'Failed to remove team');
+    }
+  }
+);
+
+// Delete team (legacy: optionally detach from a level)
+// Prefer DELETE /v3/teams/:id or DELETE /v3/levels/:id/team
+router.delete(
+  '/team/:teamId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteCreatorTeam',
+    summary: 'Delete team',
+    description:
+      'Delete team or remove from level. Query: levelId. Prefer DELETE /v3/teams/:id or DELETE /v3/levels/:id/team. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { teamId: { schema: { type: 'string' } } },
+    query: { levelId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Team deleted' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const teamId = parseInt(req.params.teamId, 10);
+      const levelIdRaw = req.query.levelId as string | undefined;
+      const levelId = levelIdRaw ? parseInt(levelIdRaw, 10) : NaN;
+
+      if (Number.isFinite(levelId)) {
+        await clearLevelTeam(levelId, transaction);
+        await transaction.commit();
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        elasticsearchService.indexLevel(levelId);
+        return res.json({message: 'Team deleted successfully'});
+      }
+
+      await deleteTeam(teamId, transaction);
+      await transaction.commit();
+      return res.json({message: 'Team deleted successfully'});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      return handleTeamMutationError(res, error, 'Failed to delete team');
+    }
+  }
+);
+
+// Get team details
+// Prefer GET /v3/teams/:id
+router.get(
+  '/team/:teamId([0-9]{1,20})',
+  ApiDoc({
+    operationId: 'getCreatorTeam',
+    summary: 'Get team',
+    description: 'Get team by ID with members and aliases. Prefer GET /v3/teams/:id.',
+    tags: ['Database', 'Creators'],
+    params: { teamId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Team' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const teamId = parseInt(req.params.teamId, 10);
+    const formattedTeam = await loadTeamFlat(teamId);
+    if (!formattedTeam) {
+      return res.status(404).json({error: 'Team not found'});
+    }
+    return res.json(formattedTeam);
+  } catch (error) {
+    logger.error('Error fetching team:', error);
+    return res.status(500).json({error: 'Failed to fetch team'});
+  }
+  }
+);
+
+// Link Discord account to creator
+router.put(
+  '/:creatorId([0-9]{1,20})/discord/:userId',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putCreatorDiscord',
+    summary: 'Link Discord to creator',
+    description: 'Link user to creator (Discord account). Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { creatorId: { schema: { type: 'string' } }, userId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Discord linked' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const {creatorId, userId} = req.params;
+
+      // Find the creator
+      const creator = await Creator.findByPk(creatorId, {transaction});
+      if (!creator) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'Creator not found'});
+      }
+
+      // Find the user
+      const user = await User.findByPk(userId, {transaction});
+      if (!user) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'User not found'});
+      }
+
+      // Update the creator with the user ID
+      await creator.update({userId}, {transaction});
+
+      await transaction.commit();
+      return res.json({message: 'Discord account linked successfully'});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      logger.error('Error linking Discord account:', error);
+      return res.status(500).json({error: 'Failed to link Discord account'});
+    }
+  }
+);
+
+// Unlink Discord account from creator
+router.delete(
+  '/:creatorId([0-9]{1,20})/discord',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteCreatorDiscord',
+    summary: 'Unlink Discord from creator',
+    description: 'Unlink user from creator. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { creatorId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Discord unlinked' }, ...standardErrorResponses404500 },
+  }),
+  async (req: Request, res: Response) => {
+    let transaction: any;
+    try {
+      transaction = await sequelize.transaction();
+      const {creatorId} = req.params;
+
+      // Find the creator
+      const creator = await Creator.findByPk(creatorId, {transaction});
+      if (!creator) {
+        await safeTransactionRollback(transaction);
+        return res.status(404).json({error: 'Creator not found'});
+      }
+
+      // Update the creator to remove the user ID
+      await creator.update({userId: null}, {transaction});
+
+      await transaction.commit();
+      return res.json({message: 'Discord account unlinked successfully'});
+    } catch (error) {
+      await safeTransactionRollback(transaction);
+      logger.error('Error unlinking Discord account:', error);
+      return res.status(500).json({error: 'Failed to unlink Discord account'});
+    }
+  }
+);
+
+// Assign creator to user (supports both UUID and playerId)
+router.put(
+  '/assign-creator-to-user/:userOrPlayerId/:creatorId',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putAssignCreatorToUser',
+    summary: 'Assign creator to user',
+    description: 'Assign creator to user or player. Params: userOrPlayerId (UUID or playerId), creatorId. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { userOrPlayerId: { schema: { type: 'string' } }, creatorId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Creator assigned' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const { userOrPlayerId, creatorId } = req.params;
+
+    // Determine if userOrPlayerId is a UUID (user ID) or playerId
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userOrPlayerId);
+
+    let user;
+    if (isUUID) {
+      // Direct user ID lookup
+      user = await User.findByPk(userOrPlayerId, { transaction });
+    } else {
+      // Player ID lookup - find user by playerId
+      const playerId = parseInt(userOrPlayerId);
+      if (isNaN(playerId)) {
+        await safeTransactionRollback(transaction);
+        return res.status(400).json({ error: 'Invalid user or player ID format' });
+      }
+
+      user = await User.findOne({
+        where: { playerId },
+        transaction
+      });
+    }
+
+    if (!user) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const creator = await Creator.findByPk(creatorId, { transaction });
+    if (!creator) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({ error: 'Creator not found' });
+    }
+
+    // Check if the creator is already assigned to another user
+    const existingUserWithCreator = await User.findOne({
+      where: { creatorId: creator.id },
+      transaction
+    });
+
+    if (existingUserWithCreator && existingUserWithCreator.id !== user.id) {
+      await safeTransactionRollback(transaction);
+      return res.status(400).json({
+        error: `Creator "${creator.name}" is already assigned to user "${existingUserWithCreator.username}" (ID: ${existingUserWithCreator.id})`
+      });
+    }
+
+    // Assign creator to user and user to creator
+    await user.update({ creatorId: creator.id }, { transaction });
+    await creator.update({ userId: user.id }, { transaction });
+
+    await transaction.commit();
+    return res.json({
+      message: 'Creator assigned to user successfully',
+      user: await User.findByPk(user.id, {
+        // Include permissionFlags — clients call hasFlag() on this payload after assign.
+        attributes: ['id', 'playerId', 'creatorId', 'username', 'permissionFlags'],
+        include: [
+          {
+            model: Creator,
+            as: 'creator',
+            attributes: ['id', 'name', 'verificationStatus'],
+          }
+        ]
+      }),
+      creator: await Creator.findByPk(creatorId),
+    });
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error assigning creator to user:', error);
+    return res.status(500).json({ error: 'Failed to assign creator to user' });
+  }
+  }
+);
+
+// Remove creator from user (supports both UUID and playerId)
+router.delete(
+  '/remove-creator-from-user/:userOrPlayerId',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteRemoveCreatorFromUser',
+    summary: 'Remove creator from user',
+    description: 'Remove creator from user or player. Params: userOrPlayerId (UUID or playerId). Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { userOrPlayerId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Creator removed' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const { userOrPlayerId } = req.params;
+
+    // Determine if userOrPlayerId is a UUID (user ID) or playerId
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userOrPlayerId);
+
+    let user;
+    if (isUUID) {
+      // Direct user ID lookup
+      user = await User.findByPk(userOrPlayerId, { transaction });
+    } else {
+      // Player ID lookup - find user by playerId
+      const playerId = parseInt(userOrPlayerId);
+      if (isNaN(playerId)) {
+        await safeTransactionRollback(transaction);
+        return res.status(400).json({ error: 'Invalid user or player ID format' });
+      }
+
+      user = await User.findOne({
+        where: { playerId },
+        transaction
+      });
+    }
+
+    if (!user) {
+      await safeTransactionRollback(transaction);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    let creator = null;
+    if (user.creatorId) {
+      creator = await Creator.findByPk(user.creatorId, { transaction });
+    }
+    // Remove creator from user
+    await user.update({ creatorId: null }, { transaction });
+    // If creator is linked to this user, remove userId from creator
+    if (creator && creator.userId === user.id) {
+      await creator.update({ userId: null }, { transaction });
+    }
+    await transaction.commit();
+    return res.json({
+      message: 'Creator removed from user successfully',
+      user: await User.findByPk(user.id, {
+        // Include permissionFlags — clients call hasFlag() on this payload after unassign.
+        attributes: ['id', 'playerId', 'creatorId', 'username', 'permissionFlags'],
+        include: [
+          {
+            model: Creator,
+            as: 'creator',
+            attributes: ['id', 'name', 'verificationStatus'],
+          }
+        ]
+      }),
+      creator: creator ? await Creator.findByPk(creator.id) : null,
+    });
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    logger.error('Error removing creator from user:', error);
+    return res.status(500).json({ error: 'Failed to remove creator from user' });
+  }
+  }
+);
+
+// Add search endpoint for creators
+router.get(
+  '/search/:name',
+  ApiDoc({
+    operationId: 'getCreatorsSearch',
+    summary: 'Search creators',
+    description: 'Search creators by name (URI-encoded).',
+    tags: ['Database', 'Creators'],
+    params: { name: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Creators list' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    // Safely decode the URI encoded search term
+    let name: string;
+    try {
+      name = decodeURIComponent(req.params.name);
+    } catch (error) {
+      logger.warn('Invalid URI encoding in creator search:', req.params.name);
+      return res.status(400).json({
+        error: 'Invalid search parameter encoding',
+        details: 'The search term contains invalid characters'
+      });
+    }
+
+    // Function to escape special characters for MySQL
+    const escapedName = escapeForMySQL(name);
+
+    const creatorsByName = await Creator.findAll({
+      where: {name: {[Op.like]: `%${escapedName}%`}},
+      attributes: ['id'],
+    });
+
+    const creatorsByAlias = await CreatorAlias.findAll({
+      where: {name: {[Op.like]: `%${escapedName}%`}},
+      attributes: ['creatorId'],
+    });
+
+    const creatorIds: Set<number> =
+    new Set(creatorsByName.map(creator => creator.id)
+    .concat(creatorsByAlias.map(alias => alias.creatorId)));
+
+    const creators = await Creator.findAll({
+      where: {id: {[Op.in]: Array.from(creatorIds)}},
+      include: [
+        {
+          model: CreatorAlias,
+          as: 'creatorAliases',
+          attributes: ['id', 'name'],
+          required: false,
+        }
+      ],
+      limit: 30,
+      attributes: ['id', 'name', 'verificationStatus']
+    });
+
+    return res.json(creators);
+  } catch (error) {
+    logger.error('Error searching creators:', error);
+    return res.status(500).json({
+      error: 'Failed to search creators',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+  }
+);
+
+// Create new team
+// Prefer POST /v3/teams
+router.post(
+  '/teams',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'postCreatorsTeam',
+    summary: 'Create team',
+    description: 'Create team. Body: name, aliases?, description?. Prefer POST /v3/teams. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    requestBody: { description: 'name, aliases, description', schema: { type: 'object', properties: { name: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } }, description: { type: 'string' } }, required: ['name'] }, required: true },
+    responses: { 200: { description: 'Team created' }, 400: { schema: errorResponseSchema }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const team = await createTeam(
+      {
+        name: req.body?.name,
+        aliases: req.body?.aliases,
+        description: req.body?.description,
+      },
+      transaction,
+    );
+    await transaction.commit();
+    return res.json({...team, type: 'team'});
+  } catch (error) {
+    await safeTransactionRollback(transaction);
+    return handleTeamMutationError(res, error, 'Failed to create team');
+  }
+  }
+);
+
+// Update team
+// Prefer PATCH /v3/teams/:id
+router.put(
+  '/teams/:teamId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'putCreatorsTeam',
+    summary: 'Update team',
+    description:
+      'Update team. Body: name?, aliases?, description?. Prefer PATCH /v3/teams/:id. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { teamId: { schema: { type: 'string' } } },
+    requestBody: { description: 'name, aliases, description', schema: { type: 'object', properties: { name: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } }, description: { type: 'string' } } }, required: true },
+    responses: { 200: { description: 'Team updated' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const teamId = parseInt(req.params.teamId, 10);
+    const team = await updateTeam(
+      teamId,
+      {
+        name: req.body?.name,
+        aliases: req.body?.aliases,
+        description: req.body?.description,
+      },
+      transaction,
+    );
+    await transaction.commit();
+    return res.json(team);
+  } catch (error) {
+    await safeTransactionRollback(transaction, logger);
+    return handleTeamMutationError(res, error, 'Failed to update team');
+  }
+  }
+);
+
+// Delete team (only if not assigned to any levels)
+// Prefer DELETE /v3/teams/:id
+router.delete(
+  '/teams/:teamId([0-9]{1,20})',
+  Auth.superAdmin(),
+  ApiDoc({
+    operationId: 'deleteCreatorsTeam',
+    summary: 'Delete team',
+    description:
+      'Delete team if not assigned to any levels. Prefer DELETE /v3/teams/:id. Super admin.',
+    tags: ['Database', 'Creators'],
+    security: ['bearerAuth'],
+    params: { teamId: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Team deleted' }, ...standardErrorResponses },
+  }),
+  async (req: Request, res: Response) => {
+  let transaction: any;
+  try {
+    transaction = await sequelize.transaction();
+    const teamId = parseInt(req.params.teamId, 10);
+    await deleteTeam(teamId, transaction);
+    await transaction.commit();
+    return res.json({ message: 'Team deleted successfully' });
+  } catch (error) {
+    await safeTransactionRollback(transaction, logger);
+    return handleTeamMutationError(res, error, 'Failed to delete team');
+  }
+  }
+);
+
+// Add search endpoint for teams
+// Prefer GET /v3/teams/search?query=
+router.get(
+  '/teams/search/:name',
+  ApiDoc({
+    operationId: 'getTeamsSearch',
+    summary: 'Search teams',
+    description: 'Search teams by name. Prefer GET /v3/teams/search?query=.',
+    tags: ['Database', 'Creators'],
+    params: { name: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Teams list' }, ...standardErrorResponses500 },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const { results } = await searchTeams({ query: name, limit: 10, offset: 0 });
+    return res.json(
+      results.map(team => ({
+        ...team,
+        type: 'team',
+      })),
+    );
+  } catch (error) {
+    logger.error('Error searching teams:', error);
+    return res.status(500).json({ error: 'Failed to search teams' });
+  }
+  }
+);
+
+export default router;

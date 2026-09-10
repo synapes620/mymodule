@@ -1,0 +1,137 @@
+import {
+  DataTypes,
+  Model,
+  Optional,
+  HasManyGetAssociationsMixin,
+  HasOneGetAssociationMixin,
+} from 'sequelize';
+import {IPass, IPlayer} from '@/server/interfaces/models/index.js';
+import Pass from '@/models/passes/Pass.js';
+import User from '@/models/auth/User.js';
+import PlayerStats from '@/models/players/PlayerStats.js';
+import { getSequelizeForModelGroup } from '@/config/db.js';
+const sequelize = getSequelizeForModelGroup('players');
+
+type PlayerCreationAttributes = Optional<
+  IPlayer,
+  'id' | 'createdAt' | 'updatedAt'
+>;
+
+class Player
+  extends Model<IPlayer, PlayerCreationAttributes>
+  implements IPlayer
+{
+  declare id: number;
+  declare name: string;
+  declare country: string;
+  declare isBanned: boolean;
+  /** Temporary ban expiry. Null with isBanned means permanent / not timed. */
+  declare bannedUntil: Date | null;
+  declare isSubmissionsPaused: boolean;
+  declare pfp: string | null;
+  /** Placement ids pinned on the profile tournaments section (max 5). */
+  declare featuredPlacementIds: number[] | null;
+  /** Placement ids hidden from the public profile tournaments section. */
+  declare hiddenPlacementIds: number[] | null;
+  /** User-defined display order for visible placements (credit ids). */
+  declare placementOrderIds: number[] | null;
+  declare placementCardLayout: string;
+  declare placementDisplayMode: 'defaultHierarchy' | 'customLayers';
+  /** When false, the public profile header hides followerCount. */
+  declare showFollowerCount: boolean;
+  declare createdAt: Date;
+  declare updatedAt: Date;
+
+  // Associations
+  declare passes?: IPass[];
+  declare getPasses: HasManyGetAssociationsMixin<Pass>;
+  declare user?: User;
+  declare getUser: HasOneGetAssociationMixin<User>;
+  declare stats?: PlayerStats;
+  declare getStats: HasOneGetAssociationMixin<PlayerStats>;
+}
+
+Player.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    name: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      unique: true,
+    },
+    country: {
+      type: DataTypes.STRING(2),
+      allowNull: false,
+    },
+    isBanned: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    bannedUntil: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
+    isSubmissionsPaused: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    pfp: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      get() {
+        return this.user?.avatarUrl || this.getDataValue('pfp') || null;
+      },
+    },
+    featuredPlacementIds: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: null,
+    },
+    hiddenPlacementIds: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: null,
+    },
+    placementOrderIds: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: null,
+    },
+    placementCardLayout: {
+      type: DataTypes.STRING(16),
+      allowNull: false,
+      defaultValue: 'default',
+    },
+    placementDisplayMode: {
+      type: DataTypes.ENUM('defaultHierarchy', 'customLayers'),
+      allowNull: false,
+      defaultValue: 'defaultHierarchy',
+    },
+    showFollowerCount: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+
+    updatedAt: {
+      type: DataTypes.DATE,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize,
+    tableName: 'players',
+    indexes: [{fields: ['name']}, {fields: ['country']}, {fields: ['bannedUntil']}],
+  },
+);
+
+export default Player;

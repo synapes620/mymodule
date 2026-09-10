@@ -1,0 +1,265 @@
+import {Router, Request, Response} from 'express';
+import {Auth} from '@/server/middleware/auth.js';
+import {ApiDoc} from '@/server/middleware/apiDoc.js';
+import { standardErrorResponses401500, standardErrorResponses500 } from '@/server/schemas/v2/admin/index.js';
+import LevelSubmission from '@/models/submissions/LevelSubmission.js';
+import {PassSubmission} from '@/models/submissions/PassSubmission.js';
+import RatingDetail from '@/models/levels/RatingDetail.js';
+import User from '@/models/auth/User.js';
+import sequelize from '@/config/db.js';
+import { Op } from 'sequelize';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { permissionFlags } from '@/config/constants.js';
+import { wherehasFlag} from '@/misc/utils/auth/permissionUtils.js';
+import { validateAndClampDate } from '@/misc/utils/server/dateUtils.js';
+import { Cache } from '@/server/middleware/cache.js';
+import { PaginationQuery } from '@/server/interfaces/models/index.js';
+const router: Router = Router();
+
+/** Automated rating account — excluded from top-rater stats/leaderboard. */
+const EXCLUDED_TOP_RATER_USERNAMES = ['autorater'];
+
+router.get(
+  '/',
+  ApiDoc({
+    operationId: 'getAdminStatistics',
+    summary: 'Admin statistics',
+    description: 'Pending level/pass submission counts. Rater auth. Cached.',
+    tags: ['Admin', 'Statistics'],
+    security: ['bearerAuth'],
+    responses: { 200: { description: 'Pending counts' }, ...standardErrorResponses401500 },
+  }),
+  //Cache({ ttl: 300, varyByUser: true, prefix: 'admin:statistics' }),
+  Auth.rater(),
+  async (req: Request, res: Response) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({error: 'User not authenticated'});
+    }
+
+    // Get pending level submissions count
+    const pendingLevelSubmissions = await LevelSubmission.count({
+      where: {
+        status: 'pending',
+      },
+    });
+
+    // Get pending pass submissions count
+    const pendingPassSubmissions = await PassSubmission.count({
+      where: {
+        status: 'pending',
+      },
+    });
+
+    // Calculate total pending submissions
+    const totalPendingSubmissions =
+      pendingLevelSubmissions + pendingPassSubmissions;
+    return res.json({
+      pendingLevelSubmissions,
+      pendingPassSubmissions,
+      totalPendingSubmissions,
+    });
+  } catch (error) {
+    logger.error('Error fetching statistics:', error);
+    return res.status(500).json({error: 'Failed to fetch statistics'});
+  }
+  }
+);
+
+router.get(
+  '/ratings-per-user',
+  // Public read: the rating page pulls this for rater activity ornaments and
+  // the Top raters popup, both of which render for anonymous visitors.
+  Auth.addUserToRequest(),
+  ApiDoc({
+    operationId: 'getAdminStatisticsRatingsPerUser',
+    summary: 'Ratings per user',
+    description: 'Ratings per rater in date range. Query: startDate, endDate, date, page, offset, limit. Cached.',
+    tags: ['Admin', 'Statistics'],
+    query: { startDate: { schema: { type: 'string' } }, endDate: { schema: { type: 'string' } }, date: { schema: { type: 'string' } }, page: { schema: { type: 'string' } }, offset: { schema: { type: 'string' } }, limit: { schema: { type: 'string' } } },
+    responses: { 200: { description: 'Ratings per user' }, ...standardErrorResponses500 },
+  }),
+  Cache({ ttl: 300, varyByQuery: ['startDate', 'endDate', 'date', 'page', 'offset', 'limit'], prefix: 'admin:statistics:ratings-per-user' }),
+  async (req: Request, res: Response) => {
+  try {
+    const { page, limit, offset } = req.query as unknown as PaginationQuery;
+    const { startDate, endDate, date } = req.query;
+    const startDateParam = (startDate || date) as string | undefined;
+
+    // Parse pagination parameters
+
+    // Parse the start date
+    let selectedStartDate: Date;
+    if (startDateParam) {
+      const defaultStartDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      selectedStartDate = validateAndClampDate(startDateParam, defaultStartDate);
+    } else {
+      // Default to a week ago if no start date provided
+      selectedStartDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    }
+    // Set start date to start of day (00:00:00.000)
+    selectedStartDate.setHours(0, 0, 0, 0);
+
+    // Parse the end date (optional)
+    let selectedEndDate: Date | null = null;
+    if (endDate) {
+      const defaultEndDate = new Date();
+      selectedEndDate = validateAndClampDate(endDate as string, defaultEndDate);
+      // Set end date to end of day (23:59:59.999)
+      selectedEndDate.setHours(23, 59, 59, 999);
+    }
+
+    // Ensure start date is not after end date (swap if needed)
+    if (selectedEndDate && selectedStartDate > selectedEndDate) {
+      logger.debug(`Start date ${selectedStartDate.toISOString()} is after end date ${selectedEndDate.toISOString()}, swapping dates`);
+      const temp = selectedStartDate;
+      selectedStartDate = selectedEndDate;
+      selectedEndDate = temp;
+      // After swapping, ensure start is at start of day and end is at end of day
+      selectedStartDate.setHours(0, 0, 0, 0);
+      selectedEndDate.setHours(23, 59, 59, 999);
+    }
+
+    // Build the where clause for the date filter
+    const dateFilter: any = {
+      createdAt: {
+        [Op.gte]: selectedStartDate
+      }
+    };
+
+    // Add end date filter if provided
+    if (selectedEndDate) {
+      dateFilter.createdAt[Op.lte] = selectedEndDate;
+    }
+
+    const excludedUsernameFilter = {
+      username: { [Op.notIn]: EXCLUDED_TOP_RATER_USERNAMES }
+    };
+
+    // Get all active raters (users who have ratings in the date range)
+    const activeRaters = await RatingDetail.findAll({
+      attributes: [
+        'userId',
+        [sequelize.fn('COUNT', sequelize.col('RatingDetail.id')), 'ratingCount']
+      ],
+      where: dateFilter,
+      include: [
+        {
+          model: User,
+          as: 'user',
+          attributes: ['username', 'avatarUrl', 'nickname'],
+          required: true,
+          where: excludedUsernameFilter
+        }
+      ],
+      group: ['RatingDetail.userId', 'user.id', 'user.username'],
+      order: [[sequelize.fn('COUNT', sequelize.col('RatingDetail.id')), 'DESC']],
+      raw: false
+    });
+
+    // Get all inactive raters (users who are raters but have no ratings in the date range)
+    const inactiveRaters = await User.findAll({
+      where: {
+        id: {
+          [Op.notIn]: activeRaters.map((result: any) => result.userId)
+        },
+        permissionFlags: wherehasFlag(permissionFlags.RATER),
+        ...excludedUsernameFilter
+      },
+      attributes: ['id', 'username', 'avatarUrl', 'nickname'],
+      order: [['username', 'ASC']] // Sort inactive raters alphabetically
+    });
+
+    // Calculate days in the range (inclusive of both start and end dates)
+    let daysDiff: number;
+    if (selectedEndDate) {
+      // If end date is provided, calculate days between start and end date (inclusive)
+      // Since start is at 00:00:00 and end is at 23:59:59, we need to add 1 to include both days
+      const millisecondsDiff = selectedEndDate.getTime() - selectedStartDate.getTime();
+      daysDiff = Math.floor(millisecondsDiff / (1000 * 60 * 60 * 24)) + 1;
+    } else {
+      // If no end date, calculate days from start date to now (inclusive of start date)
+      const now = new Date();
+      now.setHours(23, 59, 59, 999); // Set to end of today for consistent calculation
+      const millisecondsDiff = now.getTime() - selectedStartDate.getTime();
+      daysDiff = Math.floor(millisecondsDiff / (1000 * 60 * 60 * 24)) + 1;
+    }
+
+    // Get total ratings count for the entire timespan (excluding automated accounts)
+    const totalRatingsCount = await RatingDetail.count({
+      where: dateFilter,
+      include: [
+        {
+          model: User,
+          as: 'user',
+          attributes: [],
+          required: true,
+          where: excludedUsernameFilter
+        }
+      ]
+    });
+
+    // Calculate overall average ratings per day for the entire timespan
+    const overallAverageRatingsPerDay = daysDiff > 0
+      ? totalRatingsCount / daysDiff
+      : 0;
+
+    // Format active raters
+    const formattedActiveRaters = activeRaters.map((result: any) => {
+      const ratingCount = parseInt(result.dataValues.ratingCount);
+      const averagePerDay = daysDiff > 0 ? ratingCount / daysDiff : 0;
+
+      return {
+        userId: result.userId,
+        username: result.user?.username || 'Unknown',
+        avatarUrl: result.user?.avatarUrl || '',
+        nickname: result.user?.nickname || '',
+        ratingCount,
+        averagePerDay
+      };
+    });
+
+    // Format inactive raters
+    const formattedInactiveRaters = inactiveRaters.map((rater: any) => ({
+      userId: rater.id,
+      username: rater.username,
+      avatarUrl: rater.avatarUrl,
+      nickname: rater.nickname,
+      ratingCount: 0,
+      averagePerDay: 0
+    }));
+
+    // Combine both lists: active raters first, then inactive raters
+    const allRaters = [...formattedActiveRaters, ...formattedInactiveRaters];
+
+    // Calculate total count for pagination
+    const totalCount = allRaters.length;
+
+    // Apply pagination to the combined list
+    const paginatedRaters = allRaters.slice(offset, offset + limit);
+
+    return res.json({
+      startDate: selectedStartDate.toISOString(),
+      endDate: selectedEndDate ? selectedEndDate.toISOString() : null,
+      totalUsers: totalCount,
+      totalRatings: totalRatingsCount,
+      averageRatingsPerDay: overallAverageRatingsPerDay,
+      page,
+      currentPage: page,
+      totalPages: Math.ceil(totalCount / limit),
+      hasNextPage: page < Math.ceil(totalCount / limit),
+      hasPrevPage: page > 1,
+      offset,
+      limit,
+      ratingsPerUser: paginatedRaters
+    });
+
+  } catch (error) {
+    logger.error('Error fetching ratings per user:', error);
+    return res.status(500).json({error: 'Failed to fetch ratings per user'});
+  }
+  }
+);
+
+export default router;

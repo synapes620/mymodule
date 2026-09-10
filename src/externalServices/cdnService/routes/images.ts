@@ -1,0 +1,175 @@
+import { logger } from '@/server/services/core/LoggerService.js';
+import imageFactory, { ImageProcessingError } from '@/externalServices/cdnService/services/imageFactory.js';
+import { CDN_CONFIG, IMAGE_TYPES, ImageType, ImageSize, MIME_TYPES } from '@/externalServices/cdnService/config.js';
+import { Request, Response, Router } from 'express';
+import { pipeline } from 'node:stream/promises';
+import CdnFile from '@/models/cdn/CdnFile.js';
+import fs from 'fs';
+import path from 'path';
+import { cdnLocalTemp } from '@/externalServices/cdnService/infra/workspaces/cdnLocalTempManager.js';
+import { spacesStorage } from '@/externalServices/cdnService/infra/storage/spacesStorage.js';
+import { mimeTypeForImageExtension } from '@/externalServices/cdnService/services/imageProcessor.js';
+import {
+    isClientAbortError,
+    streamStorageObjectResponse,
+} from '@/externalServices/cdnService/http/responses/streamStorageObjectResponse.js';
+
+/**
+ * Image routes: sync processing today. If you add async / 202 + `X-Upload-Id` (or another job id),
+ * report every state change with the same helper as other CDN workers:
+ * `emitCdnJobProgress` from `@/externalServices/cdnService/jobs/jobProgressIngest.js`
+ * using `variant: 'pipeline'`, `kind: CDN_JOB_KIND.IMAGE_UPLOAD` (or a new agreed `kind`),
+ * and the same `status` / `error` fields as level zip ingest.
+ */
+const router = Router();
+
+// Get image endpoint
+router.get('/:type/:fileId/:size', async (req: Request, res: Response) => {
+    try {
+        const { type, fileId, size } = req.params;
+        const imageType = type.toUpperCase() as ImageType;
+        const imageSize = size as ImageSize;
+
+        if (!IMAGE_TYPES[imageType]) {
+            return res.status(400).json({ error: 'Invalid image type or size' });
+        }
+
+        // Find the original file by ID and type
+        const file = await CdnFile.findOne({
+            where: {
+                id: fileId,
+                type: imageType
+            }
+        });
+
+        if (!file) {
+            return res.status(404).json({ error: 'Image not found' });
+        }
+
+        const metadata = (file.metadata || {}) as any;
+        const variantRef = metadata?.variants?.[size];
+
+        const sizeInConfig = imageSize in IMAGE_TYPES[imageType].sizes;
+        if (!variantRef && !sizeInConfig) {
+            return res.status(400).json({ error: 'Invalid image type or size' });
+        }
+
+        if (variantRef?.path) {
+            const fileExists = await spacesStorage.fileExists(variantRef.path);
+
+            if (!fileExists) {
+                logger.debug('Image variant not found in hybrid storage', {
+                    fileId,
+                    imageType,
+                    imageSize,
+                    variantRef
+                });
+                return res.status(404).json({ error: 'Image file not found' });
+            }
+
+            await streamStorageObjectResponse(res, {
+                storagePath: variantRef.path,
+                contentType: mimeTypeForImageExtension(path.extname(variantRef.path)),
+                cacheControl: CDN_CONFIG.cacheControl,
+                openStream: storagePath => spacesStorage.getFileStream(storagePath),
+            });
+            return;
+        }
+
+        // Legacy fallback for pre-migration image records.
+        const fsPath = path.join(file.filePath, `${imageSize}.png`);
+        if (!fs.existsSync(fsPath)) {
+            logger.error(`File not found on disk: ${fsPath}`);
+            return res.status(404).json({ error: 'Image file not found' });
+        }
+
+        res.setHeader('Content-Type', MIME_TYPES[file.type as ImageType]);
+        res.setHeader('Cache-Control', CDN_CONFIG.cacheControl);
+        try {
+            await pipeline(fs.createReadStream(fsPath), res);
+        } catch (error) {
+            if (isClientAbortError(error)) {
+                return;
+            }
+            throw error;
+        }
+    } catch (error) {
+        if (isClientAbortError(error)) {
+            return;
+        }
+        logger.error('Image delivery error:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'Image delivery failed' });
+        }
+    }
+    return;
+});
+
+// Upload image endpoint
+router.post('/:type', (req: Request, res: Response) => {
+    const imageType = req.params.type.toUpperCase() as ImageType;
+    const typeHeader = req.headers['x-file-type'] as ImageType;
+
+    if (!IMAGE_TYPES[imageType]) {
+        return res.status(400).json({
+            error: 'Invalid image type',
+            code: 'INVALID_TYPE'
+        });
+    }
+
+    // Validate that type header matches the URL parameter
+    if (typeHeader && typeHeader !== imageType) {
+        return res.status(400).json({
+            error: 'Type mismatch',
+            code: 'TYPE_MISMATCH',
+            details: 'The X-File-Type header does not match the image type in the URL'
+        });
+    }
+
+    cdnLocalTemp.imageUpload(req, res, async (err) => {
+        if (err) {
+            logger.error('Image upload error:', err);
+            return res.status(400).json({
+                error: err.message,
+                code: 'UPLOAD_ERROR'
+            });
+        }
+
+        if (!req.file) {
+            return res.status(400).json({
+                error: 'No image uploaded',
+                code: 'NO_FILE'
+            });
+        }
+
+        try {
+            const result = await imageFactory.processImageUpload(
+                req.file.path,
+                imageType
+            );
+
+            res.json(result);
+        } catch (error) {
+            cdnLocalTemp.cleanupFiles(req.file.path);
+
+            if (error instanceof ImageProcessingError) {
+                return res.status(400).json({
+                    error: error.message,
+                    code: error.code,
+                    details: error.details
+                });
+            }
+
+            logger.error('Image processing error:', error);
+            res.status(500).json({
+                error: 'Image processing failed',
+                code: 'PROCESSING_ERROR',
+                details: error instanceof Error ? error.message : String(error)
+            });
+        }
+        return;
+    });
+    return;
+});
+
+export default router;

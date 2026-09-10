@@ -1,0 +1,105 @@
+import '@/observability/instrument.js';
+import '@/config/db.js';
+import express from 'express';
+import fs from 'fs';
+import cors from 'cors';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { CDN_CONFIG } from './config.js';
+import {
+    PACK_DOWNLOAD_MAX_CONCURRENT_JOBS,
+    PACK_DOWNLOAD_PARALLELISM,
+} from './domain/pack/packDownloadConfig.js';
+import { resolveSevenZipThreadCount } from './infra/archive/sevenZipCpuClamp.js';
+import router from './routes/index.js';
+import { rewriteDevLanOriginsMiddleware } from './http/middleware/rewriteDevLanOrigins.js';
+import dotenv from 'dotenv';
+import { registerGlobalProcessHandlers } from '@/server/bootstrap/processHandlers.js';
+import { sweepWorkspaceRootOnBoot } from '@/server/services/core/WorkspaceService.js';
+import { cdnLocalTemp } from './infra/workspaces/cdnLocalTempManager.js';
+import { setTerminalServiceTitle } from '@/misc/utils/terminalTitle.js';
+
+dotenv.config();
+
+
+setTerminalServiceTitle('TUF CDN');
+registerGlobalProcessHandlers();
+
+// Boot-time stale workspace sweep for the CDN process (separate PID, same root).
+// eslint-disable-next-line @typescript-eslint/no-floating-promises
+sweepWorkspaceRootOnBoot();
+
+// Boot-time sweep of the multer upload directory (`<localRoot>/temp`). Catches
+// `<uuid>.zip` leftovers from previous SIGKILL / crash mid-upload — multer
+// writes the file before any route handler runs, so it can't live in a workspace.
+// eslint-disable-next-line @typescript-eslint/no-floating-promises
+cdnLocalTemp.sweepUploadTempOnBoot();
+
+const app = express();
+
+// Ensure CDN root directory exists
+if (!fs.existsSync(CDN_CONFIG.localRoot)) {
+    fs.mkdirSync(CDN_CONFIG.localRoot, { recursive: true });
+}
+
+// Public CORS for browser asset delivery (img fetch, download-all zip, etc.).
+// Write routes stay server-to-server and are gated by requireCdnIngestKey.
+const publicReadCors = cors({
+    origin: '*',
+    methods: ['GET', 'HEAD', 'OPTIONS'],
+    allowedHeaders: '*',
+});
+app.use((req, res, next) => {
+    const method = req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+        return publicReadCors(req, res, next);
+    }
+    next();
+});
+app.use(express.json());
+
+// Dev + CDN_DEV_PUBLIC_HOST: rewrite localhost file links in write JSON to LAN IP.
+app.use(rewriteDevLanOriginsMiddleware);
+
+// Cheap liveness probe target for the standalone health service. Mounted
+// before the main router so it can't be blocked by heavy upload/parse routes
+// or any future middleware that touches the DB.
+app.get('/health', (_req, res) => {
+    res.json({ ok: true, service: 'cdn' });
+});
+
+// Global error handling middleware
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    logger.error('Express error:', {
+        error: err.message,
+        stack: err.stack,
+        path: req.path,
+        method: req.method
+    });
+
+    res.status(500).json({
+        error: 'Internal server error',
+        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
+app.use('/', router);
+
+const bindAddress = process.env.CDN_BIND_ADDRESS || '127.0.0.1';
+app.listen(CDN_CONFIG.port, bindAddress, () => {
+    logger.info(`CDN service running on http://${bindAddress}:${CDN_CONFIG.port}`);
+    logger.info('CDN CPU clamps', {
+        packMaxConcurrentJobs: PACK_DOWNLOAD_MAX_CONCURRENT_JOBS,
+        packParallelism: PACK_DOWNLOAD_PARALLELISM,
+        sevenZipThreads: resolveSevenZipThreadCount(),
+        uvThreadpoolSize: process.env.UV_THREADPOOL_SIZE || '4',
+    });
+    const lanHost = process.env.NODE_ENV === 'development'
+        ? process.env.CDN_DEV_PUBLIC_HOST?.trim()
+        : undefined;
+    if (lanHost) {
+        logger.info(`CDN write responses rewrite localhost origins to ${lanHost}`);
+    }
+});
+
+export default app;

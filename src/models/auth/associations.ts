@@ -1,0 +1,160 @@
+import User from './User.js';
+import OAuthProvider from './OAuthProvider.js';
+import RefreshToken from './RefreshToken.js';
+import StepUpCode from './StepUpCode.js';
+import TrustedDevice from './TrustedDevice.js';
+import PasskeyCredential from './PasskeyCredential.js';
+import WebAuthnChallenge from './WebAuthnChallenge.js';
+import Player from '@/models/players/Player.js';
+import Creator from '@/models/credits/Creator.js';
+import UserTufStellarBilling from '@/models/billing/UserTufStellarBilling.js';
+import UserTufStellarEntitlementSegment from '@/models/billing/UserTufStellarEntitlementSegment.js';
+import UserTufStellarAdminGrant from '@/models/billing/UserTufStellarAdminGrant.js';
+import UserClientPreferences from '@/models/auth/UserClientPreferences.js';
+import UserYoutubeChannel from '@/models/auth/UserYoutubeChannel.js';
+
+export function initializeAuthAssociations() {
+  // User <-> RefreshToken associations
+  User.hasMany(RefreshToken, {
+    foreignKey: 'userId',
+    as: 'refreshTokens',
+  });
+  RefreshToken.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(StepUpCode, {
+    foreignKey: 'userId',
+    as: 'stepUpCodes',
+  });
+  StepUpCode.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(TrustedDevice, {
+    foreignKey: 'userId',
+    as: 'trustedDevices',
+  });
+  TrustedDevice.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(PasskeyCredential, {
+    foreignKey: 'userId',
+    as: 'passkeys',
+  });
+  PasskeyCredential.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(WebAuthnChallenge, {
+    foreignKey: 'userId',
+    as: 'webauthnChallenges',
+  });
+  WebAuthnChallenge.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  // User <-> Player associations
+  User.belongsTo(Player, {
+    foreignKey: 'playerId',
+    as: 'player',
+  });
+
+  Player.hasOne(User, {
+    foreignKey: 'playerId',
+    as: 'user',
+  });
+
+  // User <-> OAuthProvider associations
+  User.hasMany(OAuthProvider, {
+    foreignKey: 'userId',
+    as: 'providers',
+  });
+
+  OAuthProvider.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'oauthUser',
+  });
+  User.hasOne(Creator, {
+  sourceKey: 'creatorId',
+    foreignKey: 'id',
+    as: 'creator',
+  });
+  // `creators.userId` ➔ `users.id` (not `users.creatorId` / `creators.id`).
+  Creator.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+  // Reverse link via `users.creatorId` ➔ `creators.id`. This is the authoritative
+  // "user owns this creator" link enforced by the assignment guard, so creator queries
+  // can surface the linked user even when the denormalized `creators.userId` is out of sync.
+  Creator.hasOne(User, {
+    sourceKey: 'id',
+    foreignKey: 'creatorId',
+    as: 'linkedUser',
+  });
+
+  User.hasOne(UserTufStellarBilling, {
+    foreignKey: 'userId',
+    as: 'tufStellarBilling',
+  });
+  UserTufStellarBilling.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(UserTufStellarEntitlementSegment, {
+    foreignKey: 'userId',
+    as: 'tufStellarEntitlementSegments',
+  });
+  UserTufStellarEntitlementSegment.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(UserTufStellarAdminGrant, {
+    foreignKey: 'beneficiaryUserId',
+    as: 'tufStellarAdminGrantsReceived',
+  });
+  User.hasMany(UserTufStellarAdminGrant, {
+    foreignKey: 'grantedByUserId',
+    as: 'tufStellarAdminGrantsGiven',
+  });
+  UserTufStellarAdminGrant.belongsTo(User, {
+    foreignKey: 'beneficiaryUserId',
+    as: 'beneficiary',
+  });
+  UserTufStellarAdminGrant.belongsTo(User, {
+    foreignKey: 'grantedByUserId',
+    as: 'grantedBy',
+  });
+  UserTufStellarAdminGrant.belongsTo(User, {
+    foreignKey: 'retractedByUserId',
+    as: 'retractedBy',
+  });
+
+  User.hasOne(UserClientPreferences, {
+    foreignKey: 'userId',
+    as: 'clientPreferences',
+  });
+  UserClientPreferences.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+  User.hasMany(UserYoutubeChannel, {
+    foreignKey: 'userId',
+    as: 'youtubeChannels',
+  });
+  UserYoutubeChannel.belongsTo(User, {
+    foreignKey: 'userId',
+    as: 'user',
+  });
+
+}

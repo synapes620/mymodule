@@ -1,0 +1,42 @@
+import { Router } from 'express';
+import utilsRoutes from './utils.js';
+import mediaRoutes from './media.js';
+import thumbnailRoutes from './thumbnails.js';
+import formRoutes from './form/index.js';
+import eventsRoutes from './events.js';
+import uploadRoutes from './upload.js';
+import externalRouter from './external.js';
+import jobsRoutes from './jobs.js';
+import usefulLinksRoutes from './usefulLinks.js';
+import modsRoutes from './mods.js';
+
+const router: Router = Router();
+
+// Utils routes
+router.use('/utils', utilsRoutes);
+
+// External routes
+router.use('/external', externalRouter);
+
+// Media routes
+router.use('/media', mediaRoutes);
+
+// Thumbnail routes
+router.use('/media', thumbnailRoutes);
+
+// Form routes
+router.use('/form', formRoutes);
+
+// Events routes
+router.use('/events', eventsRoutes);
+
+// Kind-based chunked upload router (session + kind + sha256)
+router.use('/upload', uploadRoutes);
+
+// Job progress (read)
+router.use('/jobs', jobsRoutes);
+
+router.use('/useful-links', usefulLinksRoutes);
+router.use('/mods', modsRoutes);
+
+export default router;

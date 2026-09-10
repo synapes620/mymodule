@@ -1,0 +1,1483 @@
+import express, {Request, Response, Router} from 'express';
+import { ApiDoc } from '@/server/middleware/apiDoc.js';
+import { Auth } from '@/server/middleware/auth.js';
+import { errorResponseSchema } from '@/server/schemas/v2/misc/index.js';
+import fetch from 'node-fetch';
+import axios from 'axios';
+import path from 'path';
+import fs from 'fs';
+import puppeteer from 'puppeteer';
+import * as Sentry from '@sentry/node';
+import Level from '@/models/levels/Level.js';
+import Difficulty from '@/models/levels/Difficulty.js';
+import {getVideoDetails,} from '@/misc/utils/data/videoDetailParser.js';
+import { resolveSubmissionVideoUrl } from './form/shared/videoUrl.js';
+import { gateSubmission } from './form/shared/submissionAuth.js';
+import { FormError, sendFormError } from './form/shared/errors.js';
+import User from '@/models/auth/User.js';
+import Player from '@/models/players/Player.js';
+import { effectiveAvatarForUserRow } from '@/misc/utils/subscriptions/tufStellarSubscription.js';
+import { loadUserTufStellarBilling } from '@/server/services/billing/userTufStellarBillingSupport.js';
+import {Buffer} from 'buffer';
+import { Op } from 'sequelize';
+import { seededShuffle } from '@/misc/utils/server/random.js';
+import { coalesceAxiosContentTypeHeader } from '@/misc/utils/http/axiosContentType.js';
+import { logger } from '@/server/services/core/LoggerService.js';
+import { registerShutdownStep } from '@/server/bootstrap/shutdownCoordinator.js';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
+import thumbnailsRouter from './thumbnails.js';
+import {
+  awaitThumbnailGeneration,
+  renderHtmlToPng,
+  sendThumbnailRenderError,
+  thumbnailGenerationWaitMs,
+  thumbnailWaitMs,
+} from '@/externalServices/thumbnailWorker/renderClient.js';
+import {THUMBNAIL_WORKER_CONFIG} from '@/externalServices/thumbnailWorker/config.js';
+import {
+  ensureThumbnailWorkerDirectories,
+  outputPath as thumbnailOutputPath,
+  writePngOutputAtomically,
+} from '@/externalServices/thumbnailWorker/fileStore.js';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const CACHE_PATH = process.env.CACHE_PATH || path.join(process.cwd(), 'cache');
+const WHEEL_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const execAsync = promisify(exec);
+
+function isSafeHttpRedirectUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Walk an HTTP(S) redirect chain server-side and return the final terminal URL
+ * (first 2xx response), or `null` if the chain loops back on itself, fails, or
+ * exceeds {@link RESOLVE_REDIRECT_MAX_HOPS}.
+ *
+ * Motivation: some stored URLs (`user.avatarUrl`, legacy icon CDN URLs, etc.)
+ * resolve through a hop that points back at this server's own media endpoint,
+ * which caused `api.tuforums.com redirected you too many times` errors in the
+ * browser. By resolving the chain here and redirecting the client straight to
+ * the terminal URL (R2, Cloudflare CDN, or original third-party host), we
+ * short-circuit the bounce and also let the browser cache the final asset
+ * under its real origin.
+ *
+ * Behaviors worth noting:
+ * - HEAD is used first; 405/501 triggers a fallback ranged GET (`bytes=0-0`)
+ *   that we immediately destroy, so we never buffer the asset body on the
+ *   server. This handles R2/S3 buckets that reject HEAD by default.
+ * - Cycles are caught via a `visited` set and cause `null` return — the caller
+ *   then responds 404 instead of handing the browser a URL that would loop.
+ * - Terminal (2xx) URLs are cached for {@link RESOLVED_URL_TTL_MS}; failures
+ *   and cycles are *not* cached so that transient issues self-heal.
+ */
+const RESOLVE_REDIRECT_MAX_HOPS = 8;
+const RESOLVE_REDIRECT_TIMEOUT_MS = 5000;
+const RESOLVED_URL_TTL_MS = 10 * 60 * 1000;
+const RESOLVED_URL_CACHE_CLEANUP_MS = 30 * 60 * 1000;
+const RESOLVED_URL_USER_AGENT = 'Mozilla/5.0 (TUF Redirect Resolver)';
+
+const resolvedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of resolvedUrlCache.entries()) {
+    if (value.expiresAt <= now) {
+      resolvedUrlCache.delete(key);
+    }
+  }
+}, RESOLVED_URL_CACHE_CLEANUP_MS);
+
+export async function resolveFinalRedirectUrl(initialUrl: string): Promise<string | null> {
+  if (!isSafeHttpRedirectUrl(initialUrl)) return null;
+
+  const cached = resolvedUrlCache.get(initialUrl);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.url;
+  }
+
+  const visited = new Set<string>();
+  let currentUrl = initialUrl;
+
+  for (let hop = 0; hop < RESOLVE_REDIRECT_MAX_HOPS; hop++) {
+    if (visited.has(currentUrl)) {
+      // Saw this URL already this walk — chain is cyclic; tell the caller we
+      // can't safely hand the browser a URL without triggering the loop again.
+      return null;
+    }
+    visited.add(currentUrl);
+
+    let response;
+    try {
+      response = await axios.request({
+        method: 'HEAD',
+        url: currentUrl,
+        maxRedirects: 0,
+        validateStatus: () => true,
+        timeout: RESOLVE_REDIRECT_TIMEOUT_MS,
+        headers: { 'User-Agent': RESOLVED_URL_USER_AGENT },
+      });
+    } catch (error) {
+      logger.debug('Redirect resolver HEAD failed:', formatAxiosError(error));
+      return null;
+    }
+
+    // Some origins (notably certain R2/S3 setups) reject HEAD — retry once
+    // with a 1-byte ranged GET and immediately tear down the stream so we
+    // never hold the response body in memory.
+    if (response.status === 405 || response.status === 501) {
+      try {
+        const getResponse = await axios.request({
+          method: 'GET',
+          url: currentUrl,
+          maxRedirects: 0,
+          validateStatus: () => true,
+          timeout: RESOLVE_REDIRECT_TIMEOUT_MS,
+          responseType: 'stream',
+          headers: {
+            'User-Agent': RESOLVED_URL_USER_AGENT,
+            'Range': 'bytes=0-0',
+          },
+        });
+        try { getResponse.data?.destroy?.(); } catch { /* best-effort */ }
+        response = getResponse;
+      } catch (error) {
+        logger.debug('Redirect resolver GET fallback failed:', formatAxiosError(error));
+        return null;
+      }
+    }
+
+    const { status, headers } = response;
+
+    if (status >= 300 && status < 400 && headers?.location) {
+      let nextUrl: string;
+      try {
+        nextUrl = new URL(headers.location, currentUrl).toString();
+      } catch {
+        return null;
+      }
+      if (!isSafeHttpRedirectUrl(nextUrl)) return null;
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (status >= 200 && status < 300) {
+      resolvedUrlCache.set(initialUrl, {
+        url: currentUrl,
+        expiresAt: Date.now() + RESOLVED_URL_TTL_MS,
+      });
+      return currentUrl;
+    }
+
+    // 4xx/5xx with no Location header — treat as unresolvable. We deliberately
+    // don't cache this outcome so a transient upstream hiccup self-heals.
+    return null;
+  }
+
+  return null;
+}
+
+// Helper function to format axios errors for cleaner logging
+export function formatAxiosError(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const parts = [
+      error.message,
+      error.code ? `[${error.code}]` : '',
+      error.config?.url ? `URL: ${error.config.url}` : '',
+      error.response?.status ? `Status: ${error.response.status}` : '',
+    ].filter(Boolean);
+
+    return parts.join(' ');
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function logWithCondition(message: string, source: string): void {
+  if (source === 'thumbnail' && 1!==1) {
+    logger.debug('[Thumbnail] ' + message);
+  } else if (source === 'wheel' && 1!==1) {
+    logger.debug('[Wheel] ' + message);
+  } else if (source === 'avatar' && 1!==1) {
+    logger.debug('[Avatar] ' + message);
+  } else if (source === 'github' && 1!==1) {
+    logger.debug('[Github] ' + message);
+  }
+}
+
+// Singleton Puppeteer instance
+let browser: puppeteer.Browser | null = null;
+let browserRetries = 0;
+const MAX_BROWSER_RETRIES = 2;
+const MAX_CONCURRENT_PAGES = 2;
+const MAX_QUEUED_PAGE_REQUESTS = 20;
+const PAGE_SLOT_WAIT_TIMEOUT_MS = 10_000;
+const BROWSER_ACQUIRE_TIMEOUT_MS = 70_000;
+const BROWSER_PROCESS_CLEANUP_TIMEOUT_MS = 5_000;
+const PAGE_CREATE_TIMEOUT_MS = 10_000;
+const PAGE_SETUP_TIMEOUT_MS = 5_000;
+const PAGE_CONTENT_TIMEOUT_MS = 30_000;
+const PAGE_SCREENSHOT_TIMEOUT_MS = 20_000;
+const PAGE_CLOSE_TIMEOUT_MS = 3_000;
+let activePages = 0;
+
+class PuppeteerOperationTimeoutError extends Error {
+  constructor(operation: string, timeoutMs: number) {
+    super(`${operation} timed out after ${timeoutMs}ms`);
+    this.name = 'PuppeteerOperationTimeoutError';
+  }
+}
+
+async function withPuppeteerTimeout<T>(
+  operation: string,
+  timeoutMs: number,
+  promise: Promise<T>,
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new PuppeteerOperationTimeoutError(operation, timeoutMs)),
+      timeoutMs,
+    );
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+type PageSlotRelease = () => void;
+
+interface PageSlotWaiter {
+  resolve: (release: PageSlotRelease) => void;
+  timeout: NodeJS.Timeout;
+}
+
+const pageSlotWaiters: PageSlotWaiter[] = [];
+
+function createPageSlotRelease(): PageSlotRelease {
+  let released = false;
+
+  return () => {
+    if (released) return;
+    released = true;
+    activePages = Math.max(0, activePages - 1);
+
+    const next = pageSlotWaiters.shift();
+    if (!next) return;
+
+    clearTimeout(next.timeout);
+    activePages++;
+    next.resolve(createPageSlotRelease());
+  };
+}
+
+async function acquirePageSlot(): Promise<PageSlotRelease> {
+  if (activePages < MAX_CONCURRENT_PAGES) {
+    activePages++;
+    return createPageSlotRelease();
+  }
+
+  if (pageSlotWaiters.length >= MAX_QUEUED_PAGE_REQUESTS) {
+    throw new Error(`Puppeteer render queue is full (${MAX_QUEUED_PAGE_REQUESTS})`);
+  }
+
+  return new Promise<PageSlotRelease>((resolve, reject) => {
+    let waiter: PageSlotWaiter;
+    const timeout = setTimeout(() => {
+      const index = pageSlotWaiters.indexOf(waiter);
+      if (index >= 0) pageSlotWaiters.splice(index, 1);
+      reject(new PuppeteerOperationTimeoutError('Puppeteer page slot wait', PAGE_SLOT_WAIT_TIMEOUT_MS));
+    }, PAGE_SLOT_WAIT_TIMEOUT_MS);
+
+    waiter = {resolve, timeout};
+    pageSlotWaiters.push(waiter);
+  });
+}
+
+// Add browser management lock
+let browserCreationLock: Promise<void> | null = null;
+let browserCreationLockResolve: (() => void) | null = null;
+let lockAcquiredBy: string | null = null;
+
+// Function to acquire browser creation lock
+async function acquireBrowserCreationLock(): Promise<void> {
+  const caller = new Error().stack?.split('\n')[2]?.trim() || 'unknown';
+  if (browserCreationLock) {
+    //logger.debug(`[Lock] Waiting for browser creation lock to be released. Current holder: ${lockAcquiredBy}`);
+    await browserCreationLock;
+  }
+  browserCreationLock = new Promise(resolve => {
+    browserCreationLockResolve = resolve;
+    lockAcquiredBy = caller;
+    //logger.debug(`[Lock] Browser creation lock acquired by: ${lockAcquiredBy}`);
+  });
+}
+
+// Function to release browser creation lock
+function releaseBrowserCreationLock(): void {
+  if (browserCreationLockResolve) {
+    //logger.debug(`[Lock] Browser creation lock released by: ${lockAcquiredBy}`);
+    browserCreationLockResolve();
+    browserCreationLock = null;
+    browserCreationLockResolve = null;
+    lockAcquiredBy = null;
+  } else {
+    //logger.warn('[Lock] Attempted to release browser creation lock that was not held');
+  }
+}
+
+// Function to kill existing Puppeteer Chrome processes
+async function killExistingPuppeteerProcesses(): Promise<void> {
+  if (process.platform === 'win32') {
+    // Windows implementation
+    const { stdout } = await execAsync('wmic process where "name=\'chrome.exe\'" get ExecutablePath,ProcessId /format:csv');
+
+    const lines = stdout.split('\n').filter(line => line.trim());
+    const puppeteerProcesses = lines
+      .filter(line => line.toLowerCase().includes('puppeteer'))
+      .map(line => {
+        const match = line.match(/(\d+),/);
+        return match ? match[1] : null;
+      })
+      .filter((pid): pid is string => pid !== null);
+
+    if (puppeteerProcesses.length > 0) {
+      for (const pid of puppeteerProcesses) {
+        try {
+          await execAsync(`taskkill /F /PID ${pid}`);
+          logger.info(`Killed Puppeteer Chrome process with PID: ${pid}`);
+        } catch (err) {
+          logger.warn(`Failed to kill process ${pid}:`, err);
+        }
+      }
+    } else {
+      logger.debug('No Puppeteer Chrome processes found');
+    }
+  } else {
+    // Linux/Mac - Using spawn for better process control
+    return new Promise((resolve, reject) => {
+      const pkill = spawn('pkill', ['-15', 'chrome']);
+
+      pkill.stdout.on('data', (data) => {
+        logger.debug('pkill stdout:', data.toString());
+      });
+
+      pkill.stderr.on('data', (data) => {
+        logger.debug('pkill stderr:', data.toString());
+      });
+
+      pkill.on('close', (code) => {
+        if (code === 0 || code === 1) { // 0 = success, 1 = no processes found
+          //logger.info('Successfully executed pkill command');
+          resolve();
+        } else {
+          logger.warn(`pkill exited with code ${code}`);
+          resolve(); // Still resolve as this might be a non-error case
+        }
+      });
+
+      pkill.on('error', (err) => {
+        logger.error('Error executing pkill:', err);
+        reject(err);
+      });
+    });
+  }
+}
+
+// Function to create a new browser instance
+async function createBrowser(): Promise<puppeteer.Browser> {
+  await acquireBrowserCreationLock();
+  try {
+    // Check if browser was already created while we were waiting for the lock
+    if (browser && browser.isConnected()) {
+      //logger.debug('Browser was already created while waiting for lock, returning existing instance');
+      return browser;
+    }
+
+    // Kill any existing Puppeteer processes before creating a new one
+    await withPuppeteerTimeout(
+      'Puppeteer process cleanup',
+      BROWSER_PROCESS_CLEANUP_TIMEOUT_MS,
+      killExistingPuppeteerProcesses(),
+    );
+    logger.debug('Waiting for 1 second before creating new browser instance');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    logger.debug(`Creating new browser instance (attempt ${browserRetries + 1}/${MAX_BROWSER_RETRIES})`);
+
+    const newBrowser = await puppeteer.launch({
+      headless: true,
+      defaultViewport: null,
+      args: [
+        '--disable-setuid-sandbox',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process',
+        '--disable-extensions',
+        '--disable-features=site-per-process',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-default-apps',
+        '--disable-dev-shm-usage',
+        '--disable-domain-reliability',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+        '--disable-hang-monitor',
+        '--disable-ipc-flooding-protection',
+        '--disable-notifications',
+        '--disable-renderer-backgrounding',
+        '--disable-setuid-sandbox',
+        '--disable-speech-api',
+        '--disable-sync',
+        '--hide-scrollbars',
+        '--ignore-certificate-errors',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--no-pings',
+        '--no-sandbox',
+        '--no-zygote',
+        '--password-store=basic',
+        '--use-mock-keychain',
+        '--window-size=1920,1080',
+        '--js-flags="--max-old-space-size=512"' // Limit V8 heap size
+      ],
+      timeout: 30000,
+    });
+
+    // Reset retry counter after successful launch
+    browserRetries = 0;
+
+    // Set up disconnection handler to mark the browser as needing recreation
+    newBrowser.on('disconnected', () => {
+      logger.debug('Browser disconnected, will recreate on next request');
+      if (browser === newBrowser) browser = null;
+    });
+
+    // Set the browser instance before returning
+    browser = newBrowser;
+    return newBrowser;
+  } catch (error) {
+    logger.error(`Failed to create browser: ${error instanceof Error ? error.message : String(error)}`);
+    browserRetries++;
+
+    if (browserRetries >= MAX_BROWSER_RETRIES) {
+      browserRetries = 0;
+      throw new Error(`Failed to create browser after ${MAX_BROWSER_RETRIES} attempts`);
+    }
+
+  } finally {
+    releaseBrowserCreationLock();
+  }
+
+  // Retry only after releasing the creation lock. Recursing from the catch block
+  // would wait on the lock held by this same invocation forever.
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return createBrowser();
+}
+
+function forceTerminateBrowser(targetBrowser: puppeteer.Browser, reason: string): void {
+  if (browser === targetBrowser) browser = null;
+
+  const childProcess = targetBrowser.process();
+  if (!childProcess || childProcess.killed) return;
+
+  logger.warn(`Force terminating Puppeteer browser: ${reason}`);
+  try {
+    childProcess.kill('SIGKILL');
+  } catch (error) {
+    logger.warn(`Failed to force terminate Puppeteer browser: ${error}`);
+  }
+}
+
+async function closeBrowserWithTimeout(
+  targetBrowser: puppeteer.Browser,
+  operation: string,
+): Promise<void> {
+  try {
+    await withPuppeteerTimeout(
+      operation,
+      PAGE_CLOSE_TIMEOUT_MS,
+      targetBrowser.close(),
+    );
+  } catch (error) {
+    logger.warn(`Failed to close Puppeteer browser: ${error}`);
+    forceTerminateBrowser(targetBrowser, `${operation} failed`);
+  } finally {
+    if (browser === targetBrowser) browser = null;
+  }
+}
+
+// Function to get or create browser instance
+async function getBrowser(): Promise<puppeteer.Browser> {
+  if (!browser || !browser.isConnected()) {
+    if (browser) {
+      const disconnectedBrowser = browser;
+      await closeBrowserWithTimeout(disconnectedBrowser, 'Puppeteer stale browser close');
+    }
+    browser = await createBrowser();
+  }
+  return browser;
+}
+
+// Function to convert HTML to PNG with retry logic
+export async function htmlToPng(html: string, width: number, height: number, maxRetries = 3): Promise<Buffer> {
+  return Sentry.startSpan(
+    { name: 'puppeteer.html_to_png', op: 'ui.render' },
+    async () => {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    let page: puppeteer.Page | null = null;
+    let renderBrowser: puppeteer.Browser | null = null;
+    let releasePageSlot: PageSlotRelease | null = null;
+
+    try {
+      releasePageSlot = await acquirePageSlot();
+      logWithCondition(`HTML to PNG conversion attempt ${attempt}/${maxRetries}`, 'thumbnail');
+      renderBrowser = await withPuppeteerTimeout(
+        'Puppeteer browser acquisition',
+        BROWSER_ACQUIRE_TIMEOUT_MS,
+        getBrowser(),
+      );
+      page = await withPuppeteerTimeout(
+        'Puppeteer page creation',
+        PAGE_CREATE_TIMEOUT_MS,
+        renderBrowser.newPage(),
+      );
+
+      // Set up page error handling
+      page.on('error', err => {
+        logger.error('Page error:', err);
+      });
+
+      // Set up page console logging
+      page.on('console', msg => {
+        logger.debug('Page console:', msg.text());
+      });
+
+      // Thumbnail templates are static HTML/CSS. Disabling JavaScript provides a
+      // second line of defense if an untrusted value is ever interpolated without escaping.
+      await withPuppeteerTimeout(
+        'Puppeteer JavaScript setup',
+        PAGE_SETUP_TIMEOUT_MS,
+        page.setJavaScriptEnabled(false),
+      );
+      await withPuppeteerTimeout(
+        'Puppeteer viewport setup',
+        PAGE_SETUP_TIMEOUT_MS,
+        page.setViewport({width, height}),
+      );
+      await withPuppeteerTimeout(
+        'Puppeteer HTML rendering',
+        PAGE_CONTENT_TIMEOUT_MS,
+        page.setContent(html, {timeout: PAGE_CONTENT_TIMEOUT_MS}),
+      );
+
+      // Force garbage collection if available
+      if (global.gc) {
+        global.gc();
+      }
+
+      const pngBuffer = await withPuppeteerTimeout(
+        'Puppeteer screenshot',
+        PAGE_SCREENSHOT_TIMEOUT_MS,
+        page.screenshot({
+          type: 'png',
+          omitBackground: true,
+        }),
+      );
+
+      return Buffer.from(pngBuffer);
+    } catch (error) {
+      lastError = error;
+      logger.warn(`HTML to PNG conversion failed (attempt ${attempt}/${maxRetries}): ${error instanceof Error ? error.message : String(error)}`);
+
+      if (renderBrowser && error instanceof PuppeteerOperationTimeoutError) {
+        forceTerminateBrowser(renderBrowser, error.message);
+      } else if (error instanceof Error &&
+                 (error.message.includes('Protocol error') ||
+                  error.message.includes('Connection closed') ||
+                  error.message.includes('Target closed'))) {
+        if (renderBrowser) {
+          forceTerminateBrowser(renderBrowser, error.message);
+        } else {
+          browser = null;
+        }
+      }
+    } finally {
+      if (page) {
+        try {
+          await withPuppeteerTimeout(
+            'Puppeteer page close',
+            PAGE_CLOSE_TIMEOUT_MS,
+            page.close(),
+          );
+        } catch (err) {
+          logger.warn(`Failed to close page: ${err}`);
+          if (err instanceof PuppeteerOperationTimeoutError && renderBrowser) {
+            forceTerminateBrowser(renderBrowser, 'page close timed out');
+          }
+        }
+      }
+      releasePageSlot?.();
+    }
+
+    // Wait before retrying
+    await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+  }
+
+  throw lastError || new Error('HTML to PNG conversion failed');
+    },
+  );
+}
+
+
+// Improve shutdown handlers
+async function cleanupBrowser(): Promise<void> {
+  await acquireBrowserCreationLock();
+  try {
+    if (browser) {
+      await closeBrowserWithTimeout(browser, 'Puppeteer shutdown browser close');
+    }
+    // Kill any remaining processes
+    await withPuppeteerTimeout(
+      'Puppeteer shutdown process cleanup',
+      BROWSER_PROCESS_CLEANUP_TIMEOUT_MS,
+      killExistingPuppeteerProcesses(),
+    );
+  } finally {
+    releaseBrowserCreationLock();
+  }
+}
+
+// Browser cleanup registered with the shared shutdown coordinator; duplicate SIGINT/SIGTERM
+// handlers are owned centrally in processHandlers.ts. Uncaught exception / unhandled rejection
+// are also handled there, so we don't duplicate them here.
+if (THUMBNAIL_WORKER_CONFIG.renderMode === 'local') {
+  registerShutdownStep({
+    name: 'puppeteer-browser',
+    priority: 40,
+    fn: () => cleanupBrowser(),
+  });
+
+  // Queue mode never owns Chromium. Do not register legacy browser timers or
+  // process cleanup in the API once rendering has moved to the worker.
+  let periodicBrowserCleanupRunning = false;
+  setInterval(async () => {
+    if (periodicBrowserCleanupRunning) return;
+    periodicBrowserCleanupRunning = true;
+
+    await acquireBrowserCreationLock();
+    try {
+      if (browser && activePages === 0) {
+        logger.debug('Performing periodic browser cleanup');
+        await closeBrowserWithTimeout(browser, 'Puppeteer periodic browser close');
+      }
+    } finally {
+      releaseBrowserCreationLock();
+      periodicBrowserCleanupRunning = false;
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+}
+
+const router: Router = express.Router();
+
+router.get(
+  '/image-proxy',
+  ApiDoc({
+    operationId: 'getMediaImageProxy',
+    summary: 'Proxy image by URL',
+    description: 'Fetches an image from a given URL and returns it (avoids CORS). Only allows image formats.',
+    tags: ['Media'],
+    query: { url: { description: 'Image URL to fetch', schema: { type: 'string' }, required: true } },
+    responses: {
+      200: { description: 'Image binary (Content-Type from source)' },
+      400: { description: 'Invalid or missing URL' },
+      415: { description: 'Unsupported Media Type (not an image)' },
+      500: { description: 'Error fetching image', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    const imageUrl = req.query.url;
+    const maxAttempts = 5;
+    let attempt = 1;
+
+    const ALLOWED_IMAGE_MIME = [
+      'image/png',
+      'image/jpeg',
+      'image/jpg',
+      'image/webp',
+      'image/gif',
+      'image/apng',
+      'image/bmp',
+      'image/x-icon',
+      'image/vnd.microsoft.icon',
+      'image/heic',
+      'image/heif',
+      'image/avif',
+      'image/tiff'
+    ];
+
+    // Quick file extension check, just as a first non-authoritative filter
+    function isValidImageUrl(url: string): boolean {
+      const allowedExts = /\.(png|jpg|jpeg|webp|gif|apng|bmp|ico|icon|heic|heif|avif|tiff?)$/i;
+      return allowedExts.test(url.split('?')[0]);
+    }
+
+    try {
+      if (!imageUrl || typeof imageUrl !== 'string' || !isValidImageUrl(imageUrl)) {
+        return res.status(400).send('Invalid or unsupported image URL');
+      }
+
+      while (attempt <= maxAttempts) {
+        try {
+          const response = await axios.get(imageUrl, {
+            responseType: 'arraybuffer',
+            timeout: 10000, // 10 second timeout
+            // Forward a generic browser User-Agent for privacy/compat
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Image Proxy)'
+            }
+          });
+
+          const contentType = coalesceAxiosContentTypeHeader(response.headers['content-type']);
+
+          if (
+            !contentType ||
+            !contentType.startsWith('image/') ||
+            !ALLOWED_IMAGE_MIME.includes(contentType.split(';')[0].trim())
+          ) {
+            logger.debug(`Rejected proxied resource with unsupported content-type (${String(response.headers['content-type'])}) for URL: ${imageUrl}`);
+            return res.status(415).send('Unsupported Media Type: Only images may be proxied.');
+          }
+
+          res.set('Content-Type', contentType);
+          return res.send(response.data);
+        } catch (error) {
+          // Handle 4XX errors - these are client errors and should not be retried
+          if (axios.isAxiosError(error) && error.response) {
+            const status = error.response.status;
+            if (status >= 400 && status < 500) {
+              logger.debug(`Client error (${status}) fetching image from ${imageUrl}`);
+              return res.status(status).send(`Error fetching image: ${error.message}`);
+            }
+          }
+
+          // For 5XX errors, network errors, or timeouts, retry
+          if (attempt >= maxAttempts) {
+            logger.debug(`Error fetching image after ${maxAttempts} attempts for link ${imageUrl}:`, error);
+            return res.status(500).send('Error fetching image.');
+          }
+
+          logger.debug(`Image proxy attempt #${attempt} failed for ${imageUrl}, retrying...`);
+          attempt++;
+          // Wait 1 second before retrying
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+
+      // This should never be reached, but satisfy TypeScript
+      return res.status(500).send('Error fetching image.');
+    } catch (error) {
+      logger.error(`Unexpected error in image proxy for link ${imageUrl}:`, error);
+      return res.status(500).send('Error fetching image.');
+    }
+  }
+);
+
+router.get(
+  '/bilibili',
+  ApiDoc({
+    operationId: 'getMediaBilibili',
+    summary: 'Bilibili video info',
+    description: 'Fetches video metadata from Bilibili API by bvid.',
+    tags: ['Media'],
+    query: { bvid: { description: 'Bilibili video ID (bvid)', schema: { type: 'string' }, required: true } },
+    responses: {
+      200: { description: 'Bilibili API response (video view data)' },
+      500: { description: 'Internal server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  const bvid = req.query.bvid;
+  const apiUrl = `https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`;
+  const maxAttempts = 5;
+  let attempt = 1;
+
+  while (attempt <= maxAttempts) {
+    try {
+      const response = await fetch(apiUrl);
+      const data = await response.json();
+
+      if (!response.ok) {
+        return res.status(response.status).json(data);
+      }
+
+      return res.json(data);
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        logger.error(`Error fetching data after ${maxAttempts} attempts for link ${apiUrl}:`, error);
+        return res.status(500).json({error: 'Internal Server Error'});
+      }
+      logger.debug(`Bilibili call attempt #${attempt} failed, retrying...`);
+      attempt++;
+      // Wait 1 second before retrying
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  return res.status(500).json({error: 'Internal Server Error'});
+  }
+);
+
+router.get(
+  '/player-avatar/:playerId',
+  ApiDoc({
+    operationId: 'getMediaPlayerAvatar',
+    summary: 'Player profile picture (redirect)',
+    description:
+      'Redirects to the current profile image URL for a player. Use this stable link in search indexes and clients so avatar CDN URLs can change without breaking references.',
+    tags: ['Media'],
+    params: { playerId: { description: 'Player ID', schema: { type: 'string' } } },
+    responses: {
+      302: { description: 'Redirect to current avatar URL' },
+      404: { description: 'Player or avatar not found' },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    const playerId = parseInt(req.params.playerId, 10);
+    if (!Number.isFinite(playerId) || playerId < 1) {
+      return res.status(400).send('Invalid player ID');
+    }
+    try {
+      const player = await Player.findByPk(playerId, {
+        attributes: ['id', 'pfp'],
+        include: [
+          {
+            model: User,
+            as: 'user',
+            attributes: ['avatarUrl', 'avatarIsGif', 'permissionFlags'],
+          },
+        ],
+      });
+      if (!player) {
+        return res.status(404).send('Player not found');
+      }
+      let targetUrl: string | null = player.getDataValue('pfp') || null;
+      if (player.user) {
+        const u = player.user as User;
+        const billing = await loadUserTufStellarBilling(u.id);
+        targetUrl = effectiveAvatarForUserRow(u, billing?.tufStellarSubscriptionExpiresAt ?? null);
+      }
+      if (!targetUrl || !isSafeHttpRedirectUrl(targetUrl)) {
+        return res.status(404).send('Avatar not found');
+      }
+      // Pre-walk the redirect chain so the browser never sees a URL that hops
+      // back to this server (which is what produced the ERR_TOO_MANY_REDIRECTS
+      // loops against api.tuforums.com after the R2 cutover).
+      const resolved = await resolveFinalRedirectUrl(targetUrl);
+      if (!resolved) {
+        return res.status(404).send('Avatar not resolvable');
+      }
+      return res.redirect(302, resolved);
+    } catch (error) {
+      logger.error('Error redirecting player avatar:', error instanceof Error ? error.message : error);
+      return res.status(500).send('Error resolving avatar');
+    }
+  }
+);
+
+router.get(
+  '/avatar/:userId',
+  ApiDoc({
+    operationId: 'getMediaAvatar',
+    summary: 'User avatar image',
+    description: 'Redirects to the user’s current avatar URL (always up to date; no stale disk cache).',
+    tags: ['Media'],
+    params: { userId: { description: 'User ID', schema: { type: 'string' } } },
+    responses: {
+      302: { description: 'Redirect to current avatar URL' },
+      404: { description: 'User or avatar not found' },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  const {userId} = req.params;
+  try {
+    const user = await User.findByPk(userId, {
+      attributes: ['avatarUrl', 'avatarIsGif', 'permissionFlags'],
+    });
+    const billing = user ? await loadUserTufStellarBilling(user.id) : null;
+    const displayUrl = user ? effectiveAvatarForUserRow(user, billing?.tufStellarSubscriptionExpiresAt ?? null) : null;
+    if (!user || !displayUrl) {
+      return res.status(404).send('Avatar not found');
+    }
+    if (!isSafeHttpRedirectUrl(displayUrl)) {
+      return res.status(404).send('Avatar not found');
+    }
+    // See note in /player-avatar/:playerId — follow the chain server-side so
+    // we never hand the browser a URL that bounces back to this server.
+    const resolved = await resolveFinalRedirectUrl(displayUrl);
+    if (!resolved) {
+      return res.status(404).send('Avatar not resolvable');
+    }
+    return res.redirect(302, resolved);
+  } catch (error) {
+    logger.error('Error serving avatar:', formatAxiosError(error));
+    return res.status(500).send('Error serving avatar');
+  }
+  }
+);
+
+/* unused lalala
+router.get(
+  '/github-asset',
+  ApiDoc({
+    deprecated: true,
+    operationId: 'getMediaGithubAsset',
+    summary: 'GitHub asset proxy',
+    description: 'Fetches a file from T21C-assets GitHub repo by path.',
+    tags: ['Media'],
+    query: { path: { description: 'Path within repo (e.g. path/to/file.png)', schema: { type: 'string' }, required: true } },
+    responses: {
+      200: { description: 'Asset binary' },
+      400: { description: 'Invalid path' },
+      500: { description: 'Error fetching asset', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  const assetPath = req.query.path;
+  try {
+    if (!assetPath || typeof assetPath !== 'string') {
+      return res.status(400).send('Invalid asset path');
+    }
+
+    const githubUrl = `https://raw.githubusercontent.com/T21C/T21C-assets/main/${assetPath}`;
+    const response = await axios.get(githubUrl, {
+      responseType: 'arraybuffer',
+    });
+
+    const contentType =
+      coalesceAxiosContentTypeHeader(response.headers['content-type']) ?? 'application/octet-stream';
+    res.set('Content-Type', contentType);
+    return res.send(response.data);
+  } catch (error) {
+    logger.error('Error fetching GitHub asset:', formatAxiosError(error));
+    res.status(500).send('Error fetching asset.');
+    return;
+  }
+  }
+);
+*/
+
+router.get(
+  '/image/:type/:path',
+  ApiDoc({
+    operationId: 'getMediaImage',
+    summary: 'Cached image by type and path',
+    description: 'Serves a cached image. type: "icon" or other; path: relative path within cache.',
+    tags: ['Media'],
+    params: {
+      type: { description: 'Cache type (e.g. icon)', schema: { type: 'string' } },
+      path: { description: 'Relative image path', schema: { type: 'string' } },
+    },
+    responses: {
+      200: { description: 'Image file' },
+      304: { description: 'Not modified' },
+      400: { description: 'Invalid path' },
+      403: { description: 'Access denied' },
+      404: { description: 'Image not found' },
+      500: { description: 'Server error', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  const {type, path: imagePath} = req.params;
+  try {
+    if (!imagePath || typeof imagePath !== 'string') {
+      return res.status(400).send('Invalid image path');
+    }
+
+    // Sanitize the path to prevent directory traversal
+    const sanitizedPath = path
+      .normalize(imagePath)
+      .replace(/^(\.\.(\/|\\|$))+/, '');
+
+    // Legacy difficulty icon endpoint: resolve by difficulty name and 301-redirect
+    // to the current CDN URL stored in the DB. Filenames are of the form
+    // `{maybe legacy_}{sanitizedDiffName}{_timestamp}?.{ext}` — we match the
+    // difficulty by its sanitized name to stay compatible with both the old
+    // disk-based naming (no timestamp) and the new CDN-upload naming.
+    if (type === 'icon') {
+      const stem = sanitizedPath.replace(/\.[^.]+$/, '');
+      const isLegacy = stem.startsWith('legacy_');
+      const key = isLegacy ? stem.slice('legacy_'.length) : stem;
+      // Drop any trailing `_<timestamp>` suffix we now add on upload
+      const normalizedKey = key.replace(/_\d+$/, '');
+
+      try {
+        const difficulties = await Difficulty.findAll({ attributes: ['id', 'name', 'icon', 'legacyIcon'] });
+        const match = difficulties.find(
+          d => d.name && d.name.replace(/[^a-zA-Z0-9]/g, '_') === normalizedKey,
+        );
+        if (match) {
+          const target = isLegacy ? match.legacyIcon : match.icon;
+          if (target && /^https?:\/\//i.test(target)) {
+            // Walk the redirect chain up front so a stale CDN URL that
+            // 302s back to this endpoint doesn't create an infinite loop
+            // at the browser. Fall through to disk serving on unresolvable.
+            const resolved = await resolveFinalRedirectUrl(target);
+            if (resolved) {
+              res.set('Cache-Control', 'public, max-age=300');
+              return res.redirect(301, resolved);
+            }
+          }
+        }
+      } catch (lookupError) {
+        logger.error('Error resolving legacy difficulty icon for redirect:', lookupError);
+      }
+      // Fall through to disk-based serving if no CDN URL could be resolved
+    }
+
+    let basePath;
+    if (type === 'icon') {
+      basePath = path.join(CACHE_PATH, 'icons');
+    } else {
+      basePath = CACHE_PATH;
+    }
+
+    const fullPath = path.join(basePath, sanitizedPath);
+
+    // Verify the path is within the allowed directory
+    if (!fullPath.startsWith(basePath)) {
+      return res.status(403).send('Access denied');
+    }
+
+    // Check if file exists
+    if (!fs.existsSync(fullPath)) {
+      return res.status(404).send('Image not found');
+    }
+
+    // Get file stats for cache headers
+    const stats = fs.statSync(fullPath);
+    const lastModified = stats.mtime.toUTCString();
+    const etag = `"${stats.size}-${stats.mtimeMs}"`;
+
+    // Check if client has a cached version
+    const ifNoneMatch = req.headers['if-none-match'];
+    const ifModifiedSince = req.headers['if-modified-since'];
+
+    if (
+      (ifNoneMatch && ifNoneMatch === etag) ||
+      (ifModifiedSince && new Date(ifModifiedSince) >= stats.mtime)
+    ) {
+      return res.status(304).end(); // Not Modified
+    }
+
+    // Get file extension and set content type
+    const ext = path.extname(fullPath).toLowerCase();
+    const contentType =
+      {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+      }[ext] || 'application/octet-stream';
+
+    // Set cache headers
+    res.set({
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400, stale-while-revalidate=3600',
+      'ETag': etag,
+      'Last-Modified': lastModified
+    });
+
+    return res.sendFile(fullPath);
+  } catch (error) {
+    logger.error('Error serving cached image:', error);
+    return res.status(500).send('Error serving image');
+  }
+  }
+);
+
+
+// Enhanced caching with TTL and cleanup
+interface CachedVideoDetails {
+  data: any;
+  timestamp: number;
+  expiresAt: number;
+}
+
+const VIDEO_CACHE_TTL = 1000 * 60 * 60 * 24; // 24 hours
+const VIDEO_CACHE_NULL_TTL = 1000 * 60 * 5; // 5 minutes for failed lookups
+const CACHE_CLEANUP_INTERVAL = 1000 * 60 * 30; // Clean up every 30 minutes
+
+const cachedVideoDetails = new Map<string, CachedVideoDetails>();
+const cachedVideoDetailsPromise = new Map<string, Promise<any>>();
+
+// Periodic cleanup for expired cache entries
+setInterval(() => {
+  const now = Date.now();
+  let cleanedCount = 0;
+
+  for (const [key, value] of cachedVideoDetails.entries()) {
+    if (now > value.expiresAt) {
+      cachedVideoDetails.delete(key);
+      cleanedCount++;
+    }
+  }
+
+  if (cleanedCount > 0) {
+    logger.debug('Cleaned up expired video detail cache entries:', {
+      count: cleanedCount,
+      remaining: cachedVideoDetails.size,
+      timestamp: new Date().toISOString()
+    });
+  }
+}, CACHE_CLEANUP_INTERVAL);
+
+router.get(
+  '/resolve-video-url',
+  Auth.user(),
+  ApiDoc({
+    operationId: 'getMediaResolveVideoUrl',
+    summary: 'Resolve submission video URL',
+    description:
+      'Resolves opaque b23.tv short links via b23.wtf and canonicalises other video URLs for submission forms.',
+    tags: ['Media'],
+    security: ['bearerAuth'],
+    query: {
+      url: { description: 'Raw video URL from the submission form', schema: { type: 'string' }, required: true },
+    },
+    responses: {
+      200: { description: 'Normalized URL and whether b23 resolution ran' },
+      400: { description: 'Missing or invalid URL', schema: errorResponseSchema },
+      401: { schema: errorResponseSchema },
+      403: { schema: errorResponseSchema },
+      502: { description: 'b23.wtf resolution failed', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+    try {
+      gateSubmission(req);
+
+      const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+      if (!rawUrl) {
+        return res.status(400).json({ error: 'Video URL is required' });
+      }
+
+      const result = await resolveSubmissionVideoUrl(rawUrl);
+      return res.json(result);
+    } catch (error) {
+      if (error instanceof FormError) {
+        sendFormError(res, error);
+        return;
+      }
+
+      const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+      logger.warn('Failed to resolve submission video URL:', {
+        url: rawUrl.substring(0, 80),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return res.status(502).json({ error: 'Failed to resolve b23.tv short link' });
+    }
+  },
+);
+
+router.get(
+  '/video-details/:videoLink',
+  ApiDoc({
+    operationId: 'getMediaVideoDetails',
+    summary: 'Video metadata',
+    description: 'Fetches video details (title, thumbnail, etc.) from a video URL. Supports YouTube, Bilibili, etc. Response is cached.',
+    tags: ['Media'],
+    params: { videoLink: { description: 'URL-encoded video link', schema: { type: 'string' } } },
+    responses: {
+      200: { description: 'Video details object' },
+      400: { description: 'Malformed or missing link', schema: errorResponseSchema },
+      500: { description: 'Failed to fetch details', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    let videoLink: string;
+    try {
+      videoLink = decodeURIComponent(req.params.videoLink);
+    } catch (error) {
+      if (error instanceof URIError) {
+        logger.debug('Malformed URI in video details request:', {
+          rawLink: req.params.videoLink,
+          error: error.message
+        });
+        return res.status(400).json({
+          error: 'Malformed video link',
+          details: 'The video link contains invalid URI encoding'
+        });
+      }
+      throw error;
+    }
+
+    if (!videoLink) {
+      return res.status(400).json({
+        error: 'Video link is required'
+      });
+    }
+    const now = Date.now();
+
+    // Check if we have valid cached data
+    const cached = cachedVideoDetails.get(videoLink);
+    if (cached && now < cached.expiresAt) {
+      logger.debug('Returning cached video details:', {
+        videoLink: videoLink.substring(0, 50),
+        age: Math.floor((now - cached.timestamp) / 1000) + 's',
+        timestamp: new Date().toISOString()
+      });
+      return res.json(cached.data);
+    }
+
+    // Check if there's already a pending request for this URL
+    if (cachedVideoDetailsPromise.has(videoLink)) {
+      logger.debug('Waiting for existing video details request:', {
+        videoLink: videoLink.substring(0, 50),
+        timestamp: new Date().toISOString()
+      });
+
+      try {
+        const result = await cachedVideoDetailsPromise.get(videoLink);
+        return res.json(result);
+      } catch (error) {
+        // If the promise failed, it will be cleaned up, so we'll fall through to retry
+        logger.warn('Existing video details request failed:', {
+          error: error instanceof Error ? error.message : String(error),
+          videoLink: videoLink.substring(0, 50),
+          timestamp: new Date().toISOString()
+        });
+        throw error;
+      }
+    }
+
+    // Create new request and ensure all concurrent requests wait for it
+    const videoDetailsPromise = (async () => {
+      try {
+        const videoDetails = await getVideoDetails(videoLink);
+
+        const ttl = videoDetails ? VIDEO_CACHE_TTL : VIDEO_CACHE_NULL_TTL;
+        const cacheEntry: CachedVideoDetails = {
+          data: videoDetails,
+          timestamp: now,
+          expiresAt: now + ttl
+        };
+
+        cachedVideoDetails.set(videoLink, cacheEntry);
+        /*
+        logger.debug('Fetched and cached video details:', {
+          videoLink: videoLink.substring(0, 50),
+          success: !!videoDetails,
+          ttl: Math.floor(ttl / 1000) + 's',
+          timestamp: new Date().toISOString()
+        });
+        */
+
+        return videoDetails;
+      } finally {
+        // Always clean up the promise cache after resolution (success or failure)
+        cachedVideoDetailsPromise.delete(videoLink);
+      }
+    })();
+
+    // Store the promise so concurrent requests can await it
+    cachedVideoDetailsPromise.set(videoLink, videoDetailsPromise);
+
+    // Await and return the result
+    const result = await videoDetailsPromise;
+    return res.json(result);
+
+  } catch (error) {
+    logger.error('Error getting video details:', {
+      error: error instanceof Error ? {
+        message: error.message,
+        stack: error.stack
+      } : error,
+      videoLink: req.params.videoLink?.substring(0, 50),
+      timestamp: new Date().toISOString()
+    });
+
+    return res.status(500).json({
+      error: 'Failed to fetch video details',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+router.get(
+  '/wheel-image/:seed',
+  ApiDoc({
+    deprecated: true,
+    operationId: 'getMediaWheelImage',
+    summary: 'Wheel image',
+    description: 'Generates a PNG image of a level wheel (colored segments by difficulty) using a seed for reproducible shuffle.',
+    tags: ['Media'],
+    params: { seed: { description: 'Numeric seed for wheel order', schema: { type: 'integer' } } },
+    responses: {
+      200: { description: 'PNG image' },
+      204: { description: 'Image is still processing' },
+      400: { description: 'Invalid seed' },
+      503: { description: 'Renderer unavailable' },
+      500: { description: 'Error generating image', schema: errorResponseSchema },
+    },
+  }),
+  async (req: Request, res: Response) => {
+  try {
+    const seed = parseInt(req.params.seed);
+    if (isNaN(seed)) {
+      return res.status(400).send('Invalid seed');
+    }
+
+    const wheelOutputFileName = `wheel_${seed}.png`;
+    await ensureThumbnailWorkerDirectories();
+    const wheelCachePath = thumbnailOutputPath(wheelOutputFileName);
+    try {
+      const stat = await fs.promises.stat(wheelCachePath);
+      if (stat.isFile() && Date.now() - stat.mtimeMs < WHEEL_CACHE_TTL_MS) {
+        res.set('Content-Type', 'image/png');
+        return res.send(await fs.promises.readFile(wheelCachePath));
+      }
+      await fs.promises.rm(wheelCachePath, {force: true});
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+
+    const buffer = await awaitThumbnailGeneration({
+      key: `wheel-${seed}`,
+      waitMs: thumbnailWaitMs(req),
+      produce: async () => {
+    // Get levels with the same seed logic
+    const levels = await Level.findAll({
+      where: {
+        isDeleted: false,
+        isHidden: false,
+        diffId: {
+          [Op.ne]: 0
+        }
+      },
+      include: [
+        {
+          model: Difficulty,
+          as: 'difficulty',
+          required: false,
+          attributes: ['color']
+        }
+      ],
+      attributes: ['id', 'song']
+    });
+
+    const modLevels = levels.filter(level => level.id % 4 === 0);
+    // Shuffle array using seeded random
+    const shuffledLevels = seededShuffle(modLevels, seed);
+
+    // Create SVG for the wheel
+    const width = 800;
+    const height = 800;
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const radius = Math.min(width, height) / 2 - 20;
+    const itemCount = shuffledLevels.length;
+    const anglePerItem = 360 / itemCount;
+
+    // Generate SVG segments
+    const segments = shuffledLevels.map((level, index) => {
+      const startAngle = index * anglePerItem;
+      const endAngle = (index + 1) * anglePerItem;
+      const startRad = (startAngle - 90) * Math.PI / 180;
+      const endRad = (endAngle - 90) * Math.PI / 180;
+
+      const x1 = centerX + radius * Math.cos(startRad);
+      const y1 = centerY + radius * Math.sin(startRad);
+      const x2 = centerX + radius * Math.cos(endRad);
+      const y2 = centerY + radius * Math.sin(endRad);
+      const largeArcFlag = anglePerItem > 180 ? 1 : 0;
+
+      return `
+        <path
+          d="M ${centerX} ${centerY} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${x2} ${y2} Z"
+          fill="${level.difficulty?.color || '#666666'}"
+        />
+      `;
+    }).join('');
+
+    // Create the complete SVG
+    const svg = `
+      <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+            <feMerge>
+              <feMergeNode in="coloredBlur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+        </defs>
+        <g filter="url(#glow)">
+          ${segments}
+        </g>
+      </svg>
+    `;
+
+    // Convert SVG to PNG using Puppeteer
+    const html = `
+      <html>
+        <head>
+          <style>
+            body { margin: 0; }
+          </style>
+        </head>
+        <body>
+          ${svg}
+        </body>
+      </html>
+    `;
+
+    const png = await renderHtmlToPng({
+      entityType: 'wheel',
+      entityId: seed,
+      html,
+      outputFileName: wheelOutputFileName,
+      width,
+      height,
+      waitMs: thumbnailGenerationWaitMs(),
+      localRender: () => htmlToPng(html, width, height),
+    });
+    await writePngOutputAtomically(wheelOutputFileName, png);
+    return png;
+      },
+    });
+
+    res.set('Content-Type', 'image/png');
+    return res.send(buffer);
+  } catch (error) {
+    if (sendThumbnailRenderError(res, error)) return;
+    logger.error('Error generating wheel image:', error);
+    return res.status(500).send('Error generating wheel image');
+  }
+  }
+);
+
+router.use('/', thumbnailsRouter);
+export default router;
